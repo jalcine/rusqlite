@@ -1,5 +1,10 @@
 use libsqlite3_sys as ffi;
-use std::{ffi::CStr, marker::PhantomData, os::raw, slice};
+use std::{
+    ffi::{CStr, CString},
+    marker::PhantomData,
+    os::raw,
+    slice,
+};
 
 use crate::{str_to_cstring, Error};
 
@@ -23,7 +28,7 @@ pub trait Vfs<'vfs> {
     }
 
     /// Reports the name of the virtual file system.
-    fn name() -> *const raw::c_char;
+    fn name() -> &'vfs str;
 
     /// Opens up a file.
     fn open();
@@ -74,17 +79,6 @@ pub struct Module<'vfs, T: Vfs<'vfs>> {
     phantom: PhantomData<&'vfs T>,
 }
 
-impl<'vfs, T: Vfs<'vfs>> Module<'vfs, T> {
-    fn register() {}
-    fn unregister() {}
-}
-
-impl<'vfs, T: Vfs<'vfs>> Drop for Module<'vfs, T> {
-    fn drop(&mut self) {
-        todo!()
-    }
-}
-
 /// `feature = "vfs"`
 pub struct VfsConnection(*mut ffi::sqlite3);
 
@@ -112,12 +106,12 @@ where
     raw::c_int::MAX
 }
 
-unsafe extern "C" fn rust_vfs_name<'vfs, T>() -> *const raw::c_char {
-    panic!("at the disco")
+unsafe extern "C" fn rust_vfs_name<'vfs, T: Vfs<'vfs>>() -> *const raw::c_char {
+    CStr::from_bytes_with_nul_unchecked(&T::name().as_bytes()).as_ptr()
 }
 
-unsafe extern "C" fn rust_path_name<'vfs, T>() -> raw::c_int {
-    panic!("at the disco")
+unsafe extern "C" fn rust_path_name<'vfs, T: Vfs<'vfs>>() -> raw::c_int {
+    T::max_file_path_name_length() as raw::c_int
 }
 
 unsafe extern "C" fn rust_open<'vfs, T>(
@@ -226,36 +220,44 @@ unsafe fn result_error<T>(ctx: *mut ffi::sqlite3_context, result: crate::Result<
 /// This function's not safe since it needs to build a SQLite
 /// object for virtual systems and in the act of creating, it has
 /// to create C-level objects that are `unsafe`.
-pub unsafe fn register<'vfs, T: Vfs<'vfs>>(
+pub fn register<'vfs, T: Vfs<'vfs>>(
     instance: T,
     use_as_default: bool,
 ) -> Result<Module<'vfs, T>, crate::Error> {
-    let mut base = ffi::sqlite3_vfs {
-        iVersion: T::version(),
-        szOsFile: 32,
-        mxPathname: rust_path_name::<T>(),
-        zName: rust_vfs_name::<T>(),
-        pAppData: Box::into_raw(Box::new(instance)).cast::<raw::c_void>(),
-        xOpen: Some(rust_open::<T>),
-        xDelete: Some(rust_delete::<T>),
-        xAccess: Some(rust_access::<T>),
-        xFullPathname: Some(rust_full_path_name::<T>),
-        xDlOpen: None,
-        xDlError: None,
-        xDlSym: None,
-        xDlClose: None,
-        xRandomness: Some(rust_randomness::<T>),
-        xSleep: Some(rust_sleep::<T>),
-        xCurrentTime: Some(rust_current_time::<T>),
-        xGetLastError: Some(rust_get_last_error::<T>),
-        xCurrentTimeInt64: Some(rust_current_time_64::<T>),
-        xSetSystemCall: None,
-        xGetSystemCall: None,
-        xNextSystemCall: None,
-        pNext: std::ptr::null_mut(),
+    let mut base = unsafe {
+        ffi::sqlite3_vfs {
+            iVersion: T::version(),
+            szOsFile: 32,
+            mxPathname: rust_path_name::<T>(),
+            pNext: std::ptr::null_mut(),
+            zName: rust_vfs_name::<T>(),
+            pAppData: Box::into_raw(Box::new(instance)).cast::<raw::c_void>(),
+            xOpen: Some(rust_open::<T>),
+            xDelete: Some(rust_delete::<T>),
+            xAccess: Some(rust_access::<T>),
+            xFullPathname: Some(rust_full_path_name::<T>),
+            xDlOpen: None,
+            xDlError: None,
+            xDlSym: None,
+            xDlClose: None,
+            xRandomness: Some(rust_randomness::<T>),
+            xSleep: Some(rust_sleep::<T>),
+            xCurrentTime: Some(rust_current_time::<T>),
+            xGetLastError: Some(rust_get_last_error::<T>),
+
+            #[cfg(feature = "min_sqlite_version_3_7_0")]
+            xCurrentTimeInt64: Some(rust_current_time_64::<T>),
+
+            #[cfg(feature = "min_sqlite_version_3_7_6")]
+            xSetSystemCall: None,
+            #[cfg(feature = "min_sqlite_version_3_7_6")]
+            xGetSystemCall: None,
+            #[cfg(feature = "min_sqlite_version_3_7_6")]
+            xNextSystemCall: None,
+        }
     };
     let make_default = use_as_default as raw::c_int;
-    let result = ffi::sqlite3_vfs_register(&mut base, make_default);
+    let result = unsafe { ffi::sqlite3_vfs_register(&mut base, make_default) };
 
     if result == ffi::SQLITE_OK {
         Ok(Module {
@@ -272,8 +274,8 @@ pub unsafe fn register<'vfs, T: Vfs<'vfs>>(
 mod test {
     pub struct TestVfs {}
     impl super::Vfs<'_> for TestVfs {
-        fn name() -> *const std::os::raw::c_char {
-            todo!()
+        fn name() -> &'static str {
+            "test"
         }
 
         fn open() {
@@ -328,11 +330,20 @@ mod test {
             todo!()
         }
     }
+
     #[test]
     fn loads() {
         let a_vfs = TestVfs {};
-        unsafe {
-            assert_eq!(super::register(a_vfs, false).and(Ok(())), Ok(()));
-        }
+        assert_eq!(super::register(a_vfs, false).and(Ok(())), Ok(()));
+    }
+
+    #[test]
+    fn writes() {
+        let a_vfs = TestVfs {};
+        assert_eq!(super::register(a_vfs, false).and(Ok(())), Ok(()));
+
+        // FIXME: Connect to database on disk.
+        // FIXME: Run schema to create table.
+        // FIXME: Insert rows.
     }
 }
