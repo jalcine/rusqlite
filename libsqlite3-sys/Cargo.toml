@@ -21,9 +21,9 @@ buildtime_bindgen = ["bindgen", "pkg-config", "vcpkg"]
 sqlcipher = []
 min_sqlite_version_3_6_23 = ["pkg-config", "vcpkg"]
 min_sqlite_version_3_6_8 = ["pkg-config", "vcpkg"]
-min_sqlite_version_3_7_0= ["pkg-config", "vcpkg"]
+min_sqlite_version_3_7_0 = ["pkg-config", "vcpkg"]
 min_sqlite_version_3_7_16 = ["pkg-config", "vcpkg"]
-min_sqlite_version_3_7_6= ["pkg-config", "vcpkg"]
+min_sqlite_version_3_7_6 = ["pkg-config", "vcpkg"]
 min_sqlite_version_3_7_7 = ["pkg-config", "vcpkg"]
 # Bundle only the bindings file. Note that this does nothing if
 # `buildtime_bindgen` is enabled.

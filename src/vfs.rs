@@ -1,10 +1,5 @@
 use libsqlite3_sys as ffi;
-use std::{
-    ffi::{CStr, CString},
-    marker::PhantomData,
-    os::raw,
-    slice,
-};
+use std::{ffi::CStr, marker::PhantomData, os::raw, slice};
 
 use crate::{str_to_cstring, Error};
 
@@ -272,6 +267,8 @@ pub fn register<'vfs, T: Vfs<'vfs>>(
 
 #[cfg(test)]
 mod test {
+    use crate::Connection;
+
     pub struct TestVfs {}
     impl super::Vfs<'_> for TestVfs {
         fn name() -> &'static str {
@@ -339,8 +336,11 @@ mod test {
 
     #[test]
     fn writes() {
+        use super::Vfs;
         let a_vfs = TestVfs {};
         assert_eq!(super::register(a_vfs, false).and(Ok(())), Ok(()));
+
+        let conn = Connection::open(format!("file:memory.db?vfs={}", TestVfs::name()));
 
         // FIXME: Connect to database on disk.
         // FIXME: Run schema to create table.
