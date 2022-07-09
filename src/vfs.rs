@@ -1,349 +1,516 @@
+// TODO: Implement the root VFS trait
+// TODO: Implement a trait representing a file/resource handle.
+
+// A lot of the work here is being cribbed from https://github.com/rkusa/sqlite-vfs/blob/main/src/lib.rs
+
 use libsqlite3_sys as ffi;
-use std::{ffi::CStr, marker::PhantomData, os::raw, slice};
+use std::{
+    borrow::Cow,
+    ffi::CString,
+    os::raw,
+    ptr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use crate::{str_to_cstring, Error};
+use crate::Error;
 
-///! Implement virtual file systems.
-///!
-///! (See [SQLite doc](http://sqlite.org/vfs.html))
+pub trait Resource: Sync {}
 
-// FIXME: Change this value based on flags;
-static IMPL_VERSION: u8 = 3;
+pub trait Filesystem: Sync {
+    type Handle: Resource;
 
-/// Logic around defining a virtual table.
-pub trait Vfs<'vfs> {
-    /// Depending on the feature flag used, this returns a value accordingly.
-    fn version() -> raw::c_int {
-        IMPL_VERSION as raw::c_int
+    fn full_pathname<'a>(&self, pathname: &'a str) -> Result<Cow<'a, str>, std::io::Error> {
+        Ok(pathname.into())
     }
 
-    /// Reports the max length of a file name on this system.
-    fn max_file_path_name_length() -> raw::c_int {
-        raw::c_int::MAX
+    fn resource_size() -> usize {
+        std::mem::size_of::<Self::Handle>()
     }
 
-    /// Reports the name of the virtual file system.
-    fn name() -> &'vfs str;
+    fn maximum_file_pathname_size() -> usize {
+        1024
+    }
 
-    /// Opens up a file.
-    fn open();
+    fn random_bytes(&self, buffer: &mut [i8]);
 
-    /// .
-    fn delete();
-
-    /// .
-    fn access();
-
-    /// .
-    fn full_path_name();
-
-    /// .
-    fn dl_open();
-
-    /// .
-    fn dl_error();
-
-    /// .
-    fn dl_sym();
-
-    /// .
-    fn dl_close();
-
-    /// .
-    fn randomness();
-
-    /// .
-    fn sleep();
-
-    /// .
-    fn current_time();
-
-    /// .
-    fn get_last_error();
-
-    // v2 of vfs
-
-    /// .
-    fn current_time_64();
+    fn sleep(&self, duration: Duration) -> Duration;
 }
 
-/// Module representing a virtual file system.
-#[repr(transparent)]
-pub struct Module<'vfs, T: Vfs<'vfs>> {
-    base: ffi::sqlite3_vfs,
-    phantom: PhantomData<&'vfs T>,
+static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 1;
+static RUSQLITE_VFS_VERSION_IMPL: i32 = 1;
+
+unsafe fn underlying_state<'a, F: Filesystem>(
+    ptr: *mut ffi::sqlite3_vfs,
+) -> Option<&'a mut State<F>> {
+    let vfs: &mut ffi::sqlite3_vfs = ptr.as_mut()?;
+    (vfs.pAppData as *mut State<F>).as_mut()
 }
 
-/// `feature = "vfs"`
-pub struct VfsConnection(*mut ffi::sqlite3);
+mod node {
+    use super::*;
 
-unsafe impl<'vfs, T: Vfs<'vfs>> Send for Module<'vfs, T> {}
-unsafe impl<'vfs, T: Vfs<'vfs>> Sync for Module<'vfs, T> {}
+    pub unsafe extern "C" fn close<F: Filesystem>(p_file: *mut ffi::sqlite3_file) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
 
-unsafe extern "C" fn rust_connect<'vfs, T>(
-    db: *mut ffi::sqlite3,
-    aux: *mut raw::c_void,
-    argc: raw::c_int,
-    argv: *const *const raw::c_char,
-    pp_vtab: *mut *mut ffi::sqlite3_vfs,
-    err_msg: *mut *mut raw::c_char,
-) -> raw::c_int
-where
-    T: Vfs<'vfs>,
-{
-    let mut conn = VfsConnection(db);
-    let args = slice::from_raw_parts(argv, argc as usize);
-    let vec = args
-        .iter()
-        .map(|&cs| CStr::from_ptr(cs).to_bytes()) // FIXME .to_str() -> Result<&str, Utf8Error>
-        .collect::<Vec<_>>();
+    pub unsafe extern "C" fn read(
+        p_file: *mut ffi::sqlite3_file,
+        z_buf: *mut raw::c_void,
+        i_amt: raw::c_int,
+        i_ofst: ffi::sqlite3_int64,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
 
-    raw::c_int::MAX
+    pub unsafe extern "C" fn write(
+        p_file: *mut ffi::sqlite3_file,
+        z: *const raw::c_void,
+        i_amt: raw::c_int,
+        i_ofst: ffi::sqlite3_int64,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn truncate(
+        p_file: *mut ffi::sqlite3_file,
+        size: ffi::sqlite3_int64,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn sync(p_file: *mut ffi::sqlite3_file, flags: raw::c_int) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn file_size(
+        p_file: *mut ffi::sqlite3_file,
+        p_size: *mut ffi::sqlite3_int64,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn lock(
+        p_file: *mut ffi::sqlite3_file,
+        e_lock: raw::c_int,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn unlock(
+        p_file: *mut ffi::sqlite3_file,
+        e_lock: raw::c_int,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+    pub unsafe extern "C" fn check_reserved_lock(
+        p_file: *mut ffi::sqlite3_file,
+        p_res_out: *mut raw::c_int,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn file_control(
+        p_file: *mut ffi::sqlite3_file,
+        op: raw::c_int,
+        p_arg: *mut raw::c_void,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn sector_size(p_file: *mut ffi::sqlite3_file) -> raw::c_int {
+        1024
+    }
+    pub unsafe extern "C" fn device_characteristics(p_file: *mut ffi::sqlite3_file) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+    pub unsafe extern "C" fn shm_map(
+        p_file: *mut ffi::sqlite3_file,
+        region_ix: raw::c_int,
+        region_size: raw::c_int,
+        b_extend: raw::c_int,
+        pp: *mut *mut raw::c_void,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn shm_lock(
+        p_file: *mut ffi::sqlite3_file,
+        offset: raw::c_int,
+        n: raw::c_int,
+        flags: raw::c_int,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn shm_barrier(p_file: *mut ffi::sqlite3_file) {}
+
+    pub unsafe extern "C" fn shm_unmap(
+        p_file: *mut ffi::sqlite3_file,
+        delete_flags: raw::c_int,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
 }
 
-unsafe extern "C" fn rust_vfs_name<'vfs, T: Vfs<'vfs>>() -> *const raw::c_char {
-    CStr::from_bytes_with_nul_unchecked(&T::name().as_bytes()).as_ptr()
-}
+mod fs {
+    use std::time::Duration;
 
-unsafe extern "C" fn rust_path_name<'vfs, T: Vfs<'vfs>>() -> raw::c_int {
-    T::max_file_path_name_length() as raw::c_int
-}
+    use super::*;
 
-unsafe extern "C" fn rust_open<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    name: *const raw::c_char,
-    file: *mut ffi::sqlite3_file,
-    flags: raw::c_int,
-    resulting_flags: *mut raw::c_int,
-) -> raw::c_int {
-    panic!("at the disco")
-}
+    pub unsafe extern "C" fn open<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_name: *const raw::c_char,
+        p_file: *mut ffi::sqlite3_file,
+        flags: raw::c_int,
+        p_out_flags: *mut raw::c_int,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
 
-unsafe extern "C" fn rust_delete<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    name: *const raw::c_char,
-    sync_directory: raw::c_int,
-) -> raw::c_int {
-    panic!("at the disco")
-}
+    pub unsafe extern "C" fn delete<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_path: *const raw::c_char,
+        _sync_dir: raw::c_int,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
 
-unsafe extern "C" fn rust_access<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    name: *const raw::c_char,
-    flags: raw::c_int,
-    resulting_flags: *mut raw::c_int,
-) -> raw::c_int {
-    panic!("at the disco")
-}
+    pub unsafe extern "C" fn access<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_path: *const raw::c_char,
+        flags: raw::c_int,
+        p_res_out: *mut raw::c_int,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
 
-unsafe extern "C" fn rust_full_path_name<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    name: *const raw::c_char,
-    name_size: raw::c_int,
-    resulting_file_path: *mut raw::c_char,
-) -> raw::c_int {
-    panic!("at the disco")
-}
+    pub unsafe extern "C" fn full_pathname<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_path: *const raw::c_char,
+        n_out: raw::c_int,
+        z_out: *mut raw::c_char,
+    ) -> raw::c_int {
+        ffi::SQLITE_OK
+    }
+    pub unsafe extern "C" fn dl_open<V>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_path: *const raw::c_char,
+    ) -> *mut raw::c_void {
+        ptr::null_mut() as *mut raw::c_void
+    }
 
-unsafe extern "C" fn rust_randomness<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    bytes_count: raw::c_int,
-    resulting_bytes: *mut raw::c_char,
-) -> raw::c_int {
-    panic!("at the disco")
-}
+    /// Populate the buffer `z_err_msg` (size `n_byte` bytes) with a human readable utf-8 string
+    /// describing the most recent error encountered associated with dynamic libraries.
+    #[allow(unused_variables)]
+    pub unsafe extern "C" fn dl_error<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        n_byte: raw::c_int,
+        z_err_msg: *mut raw::c_char,
+    ) {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(state) => state,
+            None => return,
+        };
 
-unsafe extern "C" fn rust_sleep<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    microseconds: raw::c_int,
-) -> raw::c_int {
-    panic!("at the disco")
-}
-unsafe extern "C" fn rust_current_time<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    resulting_time: *mut raw::c_double,
-) -> raw::c_int {
-    panic!("at the disco")
-}
-unsafe extern "C" fn rust_get_last_error<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    error_code: raw::c_int,
-    error_message: *mut raw::c_char,
-) -> raw::c_int {
-    panic!("at the disco")
-}
-unsafe extern "C" fn rust_current_time_64<'vfs, T>(
-    vfs: *mut ffi::sqlite3_vfs,
-    resulting_time: *mut raw::c_long,
-) -> raw::c_int {
-    panic!("at the disco")
-}
-#[cold]
-unsafe fn result_error<T>(ctx: *mut ffi::sqlite3_context, result: crate::Result<T>) -> raw::c_int {
-    match result {
-        Ok(_) => ffi::SQLITE_OK,
-        Err(Error::SqliteFailure(err, s)) => {
-            match err.extended_code {
-                ffi::SQLITE_TOOBIG => {
-                    ffi::sqlite3_result_error_toobig(ctx);
-                }
-                ffi::SQLITE_NOMEM => {
-                    ffi::sqlite3_result_error_nomem(ctx);
-                }
-                code => {
-                    ffi::sqlite3_result_error_code(ctx, code);
-                    if let Some(Ok(cstr)) = s.map(|s| str_to_cstring(&s)) {
-                        ffi::sqlite3_result_error(ctx, cstr.as_ptr(), -1);
-                    }
-                }
+        if let Some(dlerror) = state.parent.as_ref().and_then(|v| v.xDlError) {
+            return dlerror(state.parent, n_byte, z_err_msg);
+        }
+    }
+
+    /// Return a pointer to the symbol `z_sym` in the dynamic library pHandle.
+    #[allow(unused_variables)]
+    pub unsafe extern "C" fn dl_symbol<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        p: *mut raw::c_void,
+        z_sym: *const raw::c_char,
+    ) -> Option<unsafe extern "C" fn(*mut ffi::sqlite3_vfs, *mut raw::c_void, *const raw::c_char)>
+    {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(state) => state,
+            None => return None,
+        };
+
+        state
+            .parent
+            .as_ref()
+            .and_then(|v| v.xDlSym)
+            .and_then(|dl_symbol| dl_symbol(state.parent, p, z_sym))
+    }
+
+    /// Close the dynamic library handle `p_handle`.
+    #[allow(unused_variables)]
+    pub unsafe extern "C" fn dl_close<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        p_handle: *mut raw::c_void,
+    ) {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(state) => state,
+            None => return,
+        };
+
+        if let Some(dl_close) = state.parent.as_ref().and_then(|v| v.xDlClose) {
+            return dl_close(state.parent, p_handle);
+        }
+    }
+
+    /// Populate the buffer pointed to by `z_buf_out` with `n_byte` bytes of random data.
+    pub unsafe extern "C" fn randomness<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        n_byte: raw::c_int,
+        z_buf_out: *mut raw::c_char,
+    ) -> raw::c_int {
+        let bytes = std::slice::from_raw_parts_mut(z_buf_out as *mut i8, n_byte as usize);
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(state) => state,
+            None => return 0,
+        };
+
+        state.system.random_bytes(bytes);
+        bytes.len() as raw::c_int
+    }
+
+    /// Sleep for `n_micro` microseconds. Return the number of microseconds actually slept.
+    pub unsafe extern "C" fn sleep<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        n_micro: raw::c_int,
+    ) -> raw::c_int {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(state) => state,
+            None => return ffi::SQLITE_ERROR,
+        };
+        state
+            .system
+            .sleep(Duration::from_micros(n_micro as u64))
+            .as_micros() as raw::c_int
+    }
+
+    /// Return the current time as a Julian Day number in `p_time_out`.
+    pub unsafe extern "C" fn current_time<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        p_time_out: *mut f64,
+    ) -> raw::c_int {
+        let mut i = 0i64;
+        current_time_i64::<F>(p_vfs, &mut i);
+
+        *p_time_out = i as f64 / 86400000.0;
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn current_time_i64<F: Filesystem>(
+        _p_vfs: *mut ffi::sqlite3_vfs,
+        p: *mut i64,
+    ) -> i32 {
+        const UNIX_EPOCH: i64 = 24405875 * 8640000;
+        let now = UNIX_EPOCH;
+
+        *p = now;
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn set_system_call<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_name: *const ::std::os::raw::c_char,
+        p_new_func: ffi::sqlite3_syscall_ptr,
+    ) -> ::std::os::raw::c_int {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(state) => state,
+            None => return ffi::SQLITE_ERROR,
+        };
+
+        if let Some(set_system_call) = state.parent.as_ref().and_then(|v| v.xSetSystemCall) {
+            return set_system_call(state.parent, z_name, p_new_func);
+        }
+
+        ffi::SQLITE_ERROR
+    }
+
+    pub unsafe extern "C" fn get_system_call<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_name: *const ::std::os::raw::c_char,
+    ) -> ffi::sqlite3_syscall_ptr {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(state) => state,
+            None => return None,
+        };
+
+        if let Some(get_system_call) = state.parent.as_ref().and_then(|v| v.xGetSystemCall) {
+            return get_system_call(state.parent, z_name);
+        }
+
+        None
+    }
+
+    pub unsafe extern "C" fn next_system_call<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_name: *const ::std::os::raw::c_char,
+    ) -> *const ::std::os::raw::c_char {
+        if let Some(state) = underlying_state::<F>(p_vfs) {
+            state
+                .parent
+                .as_ref()
+                .and_then(|v| v.xNextSystemCall)
+                .map(|c| c(state.parent, z_name))
+                .unwrap_or(ptr::null())
+        } else {
+            ptr::null()
+        }
+    }
+
+    pub unsafe extern "C" fn get_last_error<F: Filesystem>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        n_byte: raw::c_int,
+        z_err_msg: *mut raw::c_char,
+    ) -> raw::c_int {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(state) => state,
+            None => return ffi::SQLITE_ERROR,
+        };
+        if let Some((eno, err)) = state.error.lock().unwrap().as_ref() {
+            let msg = match CString::new(err.to_string()) {
+                Ok(msg) => msg,
+                Err(_) => return ffi::SQLITE_ERROR,
             };
-            err.extended_code
-        }
-        Err(err) => {
-            ffi::sqlite3_result_error_code(ctx, ffi::SQLITE_ERROR);
-            if let Ok(cstr) = str_to_cstring(&err.to_string()) {
-                ffi::sqlite3_result_error(ctx, cstr.as_ptr(), -1);
+
+            let msg = msg.to_bytes_with_nul();
+            if msg.len() > n_byte as usize {
+                return ffi::SQLITE_ERROR;
             }
-            ffi::SQLITE_ERROR
+            let out = std::slice::from_raw_parts_mut(z_err_msg as *mut u8, msg.len());
+            out.copy_from_slice(msg);
+
+            return *eno;
         }
+        ffi::SQLITE_OK
     }
 }
 
-/// Registers a virtual filesystem into SQLite.
-///
-/// # Safety
-/// This function's not safe since it needs to build a SQLite
-/// object for virtual systems and in the act of creating, it has
-/// to create C-level objects that are `unsafe`.
-pub fn register<'vfs, T: Vfs<'vfs>>(
-    instance: T,
-    use_as_default: bool,
-) -> Result<Module<'vfs, T>, crate::Error> {
-    let mut base = unsafe {
-        ffi::sqlite3_vfs {
-            iVersion: T::version(),
-            szOsFile: 32,
-            mxPathname: rust_path_name::<T>(),
-            pNext: std::ptr::null_mut(),
-            zName: rust_vfs_name::<T>(),
-            pAppData: Box::into_raw(Box::new(instance)).cast::<raw::c_void>(),
-            xOpen: Some(rust_open::<T>),
-            xDelete: Some(rust_delete::<T>),
-            xAccess: Some(rust_access::<T>),
-            xFullPathname: Some(rust_full_path_name::<T>),
-            xDlOpen: None,
-            xDlError: None,
-            xDlSym: None,
-            xDlClose: None,
-            xRandomness: Some(rust_randomness::<T>),
-            xSleep: Some(rust_sleep::<T>),
-            xCurrentTime: Some(rust_current_time::<T>),
-            xGetLastError: Some(rust_get_last_error::<T>),
+struct State<F: Filesystem> {
+    name: CString,
+    system: Arc<F>,
+    parent: *mut ffi::sqlite3_vfs,
+    io: ffi::sqlite3_io_methods,
+    error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
+}
 
-            #[cfg(feature = "min_sqlite_version_3_7_0")]
-            xCurrentTimeInt64: Some(rust_current_time_64::<T>),
-
-            #[cfg(feature = "min_sqlite_version_3_7_6")]
-            xSetSystemCall: None,
-            #[cfg(feature = "min_sqlite_version_3_7_6")]
-            xGetSystemCall: None,
-            #[cfg(feature = "min_sqlite_version_3_7_6")]
-            xNextSystemCall: None,
-        }
+// FIXME: Provide a return value capable of checking if it's still registered and unregistering.
+/// Registers a new virtual file system to SQLite.
+pub fn register<F: Filesystem>(
+    vfs_name: impl ToString,
+    system: F,
+    as_default: bool,
+) -> Result<(), Error> {
+    let io_methods = ffi::sqlite3_io_methods {
+        iVersion: RUSQLITE_VFS_VERSION_IO_METHODS,
+        xClose: Some(node::close::<F>),
+        xRead: Some(node::read),
+        xWrite: Some(node::write),
+        xTruncate: Some(node::truncate),
+        xSync: Some(node::sync),
+        xFileSize: Some(node::file_size),
+        xLock: Some(node::lock),
+        xUnlock: Some(node::unlock),
+        xCheckReservedLock: Some(node::check_reserved_lock),
+        xFileControl: Some(node::file_control),
+        xSectorSize: Some(node::sector_size),
+        xDeviceCharacteristics: Some(node::device_characteristics),
+        xShmMap: Some(node::shm_map),
+        xShmLock: Some(node::shm_lock),
+        xShmBarrier: Some(node::shm_barrier),
+        xShmUnmap: Some(node::shm_unmap),
+        xFetch: None,
+        xUnfetch: None,
     };
-    let make_default = use_as_default as raw::c_int;
-    let result = unsafe { ffi::sqlite3_vfs_register(&mut base, make_default) };
+    let name = CString::new(vfs_name.to_string().as_str())?;
+    let name_cstr = name.as_ptr();
+    let ptr = Box::into_raw(Box::new(State {
+        name: name.clone(),
+        system: Arc::new(system),
+        parent: unsafe { ffi::sqlite3_vfs_find(ptr::null_mut()) },
+        io: io_methods,
+        error: Arc::new(Default::default()),
+    }));
+    let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
+        iVersion: RUSQLITE_VFS_VERSION_IMPL,
+        szOsFile: F::resource_size() as raw::c_int,
+        mxPathname: F::maximum_file_pathname_size() as raw::c_int,
+        pNext: ptr::null_mut(),
+        zName: name_cstr,
+        pAppData: ptr as _,
+        xOpen: Some(fs::open::<F>),
+        xDelete: Some(fs::delete::<F>),
+        xAccess: Some(fs::access::<F>),
+        xFullPathname: Some(fs::full_pathname::<F>),
+        xDlOpen: Some(fs::dl_open::<F>),
+        xDlError: Some(fs::dl_error::<F>),
+        xDlSym: Some(fs::dl_symbol::<F>),
+        xDlClose: Some(fs::dl_close::<F>),
+        xRandomness: Some(fs::randomness::<F>),
+        xSleep: Some(fs::sleep::<F>),
+        xCurrentTime: Some(fs::current_time::<F>),
+        xGetLastError: Some(fs::get_last_error::<F>),
+        xCurrentTimeInt64: Some(fs::current_time_i64::<F>),
+        xSetSystemCall: Some(fs::set_system_call::<F>),
+        xGetSystemCall: Some(fs::get_system_call::<F>),
+        xNextSystemCall: Some(fs::next_system_call::<F>),
+    }));
 
-    if result == ffi::SQLITE_OK {
-        Ok(Module {
-            base,
-            phantom: PhantomData::<&T>,
-        })
-    } else {
-        // FIXME: Add custom error here.
-        panic!("ffoo")
-    }
+    let vfs_register_result = unsafe { ffi::sqlite3_vfs_register(vfs, as_default as raw::c_int) };
+    if vfs_register_result != ffi::SQLITE_OK {
+        return Err(Error::SqliteFailure(
+            ffi::Error::new(vfs_register_result),
+            Some(format!("Failed to register the {:?} VFS.", name)),
+        ));
+    };
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod test {
-    use crate::Connection;
+    struct MockFs {}
+    struct MockHandle {}
 
-    pub struct TestVfs {}
-    impl super::Vfs<'_> for TestVfs {
-        fn name() -> &'static str {
-            "test"
-        }
+    impl super::Resource for MockHandle {}
 
-        fn open() {
+    impl super::Filesystem for MockFs {
+        type Handle = MockHandle;
+
+        fn random_bytes(&self, buffer: &mut [i8]) {
             todo!()
         }
 
-        fn delete() {
-            todo!()
-        }
-
-        fn access() {
-            todo!()
-        }
-
-        fn full_path_name() {
-            todo!()
-        }
-
-        fn dl_open() {
-            todo!()
-        }
-
-        fn dl_error() {
-            todo!()
-        }
-
-        fn dl_sym() {
-            todo!()
-        }
-
-        fn dl_close() {
-            todo!()
-        }
-
-        fn randomness() {
-            todo!()
-        }
-
-        fn sleep() {
-            todo!()
-        }
-
-        fn current_time() {
-            todo!()
-        }
-
-        fn get_last_error() {
-            todo!()
-        }
-
-        fn current_time_64() {
+        fn sleep(&self, duration: std::time::Duration) -> std::time::Duration {
             todo!()
         }
     }
 
     #[test]
-    fn loads() {
-        let a_vfs = TestVfs {};
-        assert_eq!(super::register(a_vfs, false).and(Ok(())), Ok(()));
+    fn registers() {
+        use super::register;
+
+        let register_result = register("test-vfs", MockFs {}, false);
+        assert!(register_result.is_ok());
     }
 
     #[test]
-    fn writes() {
-        use super::Vfs;
-        let a_vfs = TestVfs {};
-        assert_eq!(super::register(a_vfs, false).and(Ok(())), Ok(()));
+    fn generates_schema() {
+        use super::register;
+        let mock_fs = MockFs {};
 
-        let conn = Connection::open(format!("file:memory.db?vfs={}", TestVfs::name()));
+        let register_result = register("test-vfs", mock_fs, false);
+        assert_eq!(
+            register_result.as_ref().err(),
+            None,
+            "registered vfs safely"
+        );
 
-        // FIXME: Connect to database on disk.
-        // FIXME: Run schema to create table.
-        // FIXME: Insert rows.
+        let conn_result = crate::Connection::open_with_flags_and_vfs(
+            "mock-system.db",
+            crate::OpenFlags::SQLITE_OPEN_READ_WRITE | crate::OpenFlags::SQLITE_OPEN_CREATE,
+            "test-vfs",
+        );
+
+        assert_eq!(conn_result.as_ref().err(), None, "connection was opened");
     }
 }

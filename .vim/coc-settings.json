@@ -1,0 +1,3 @@
+{
+  "rust-analyzer.cargo.features": ["vfs", "trace", "bundled"]
+}
