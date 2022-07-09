@@ -15,6 +15,12 @@ use std::{
 
 use crate::Error;
 
+#[repr(C)]
+pub struct File<R: Resource> {
+    base: ffi::sqlite3_file,
+    resource: R,
+}
+
 pub trait Resource: Sync {}
 
 pub trait Filesystem: Sync {
@@ -24,17 +30,27 @@ pub trait Filesystem: Sync {
         Ok(pathname.into())
     }
 
-    fn resource_size() -> usize {
-        std::mem::size_of::<Self::Handle>()
-    }
-
     fn maximum_file_pathname_size() -> usize {
         1024
+    }
+
+    /// Check access to `db`. The default implementation always returns `true`.
+    fn exists(&self, _db: &str) -> Result<bool, std::io::Error> {
+        Ok(true)
+    }
+
+    /// Check access to `db`. The default implementation always returns `true`.
+    fn access(&self, _db: &str, _write: bool) -> Result<bool, std::io::Error> {
+        Ok(true)
     }
 
     fn random_bytes(&self, buffer: &mut [i8]);
 
     fn sleep(&self, duration: Duration) -> Duration;
+
+    fn open(&self, path: String, flags: crate::OpenFlags) -> Result<Self::Handle, std::io::Error>;
+
+    fn temporary_name(&self) -> String;
 }
 
 static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 1;
@@ -48,18 +64,35 @@ unsafe fn underlying_state<'a, F: Filesystem>(
 }
 
 mod node {
+    use std::io::ErrorKind;
+
     use super::*;
 
     pub unsafe extern "C" fn close<F: Filesystem>(p_file: *mut ffi::sqlite3_file) -> raw::c_int {
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn read(
+    pub unsafe extern "C" fn read<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
         z_buf: *mut raw::c_void,
         i_amt: raw::c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> raw::c_int {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(s) => s,
+            None => return ffi::SQLITE_ERROR,
+        };
+
+        let out = slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
+        if let Err(err) = state..read_exact_at(out, i_ofst as u64) {
+            let kind = err.kind();
+            if kind == ErrorKind::UnexpectedEof {
+                return ffi::SQLITE_IOERR_SHORT_READ;
+            } else {
+                return state.set_last_error(ffi::SQLITE_IOERR_READ, err);
+            }
+        }
+
         ffi::SQLITE_OK
     }
 
@@ -154,7 +187,7 @@ mod node {
 }
 
 mod fs {
-    use std::time::Duration;
+    use std::{ffi::CStr, io::ErrorKind, time::Duration};
 
     use super::*;
 
@@ -165,6 +198,69 @@ mod fs {
         flags: raw::c_int,
         p_out_flags: *mut raw::c_int,
     ) -> raw::c_int {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(s) => s,
+            None => return ffi::SQLITE_ERROR,
+        };
+
+        let name = if z_name.is_null() {
+            None
+        } else {
+            match CStr::from_ptr(z_name).to_str() {
+                Ok(name) => Some(name.to_string()),
+                Err(_) => {
+                    return state.set_last_error(
+                        ffi::SQLITE_CANTOPEN,
+                        std::io::Error::new(
+                            ErrorKind::Other,
+                            format!(
+                                "open failed: database name must be valid utf8 (received: {:?})",
+                                CStr::from_ptr(z_name)
+                            ),
+                        ),
+                    )
+                }
+            }
+        };
+
+        println!("omg {:?}", name);
+
+        let opts = match crate::OpenFlags::from_bits(flags) {
+            Some(opts) => opts,
+            None => {
+                return state.set_last_error(
+                    ffi::SQLITE_CANTOPEN,
+                    std::io::Error::new(ErrorKind::Other, "invalid open flags"),
+                );
+            }
+        };
+
+        let out_file = match (p_file as *mut File<F::Handle>).as_mut() {
+            Some(f) => f,
+            None => {
+                return state.set_last_error(
+                    ffi::SQLITE_CANTOPEN,
+                    std::io::Error::new(ErrorKind::Other, "invalid pointer to file resource"),
+                );
+            }
+        };
+
+        let usable_name = name.map_or_else(|| state.system.temporary_name(), String::from);
+        let filesystem_resource_handle = match state.system.open(usable_name, opts) {
+            Ok(resource) => resource,
+            Err(err) => {
+                state.set_last_error(ffi::SQLITE_CANTOPEN, dbg!(err));
+                return ffi::SQLITE_ERROR;
+            }
+        };
+
+        if let Some(p_out_flags) = p_out_flags.as_mut() {
+            *p_out_flags = opts.bits();
+        }
+
+        out_file.base.pMethods = &state.io;
+        out_file.resource = filesystem_resource_handle;
+
         ffi::SQLITE_OK
     }
 
@@ -182,6 +278,38 @@ mod fs {
         flags: raw::c_int,
         p_res_out: *mut raw::c_int,
     ) -> raw::c_int {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(s) => s,
+            None => return ffi::SQLITE_ERROR,
+        };
+        let path = match CStr::from_ptr(z_path).to_str() {
+            Ok(name) => name,
+            Err(_) => {
+                if let Some(p_res_out) = p_res_out.as_mut() {
+                    *p_res_out = false as i32;
+                }
+
+                return ffi::SQLITE_OK;
+            }
+        };
+
+        let result = match flags {
+            ffi::SQLITE_ACCESS_EXISTS => state.system.exists(path),
+            ffi::SQLITE_ACCESS_READ => state.system.access(path, false),
+            ffi::SQLITE_ACCESS_READWRITE => state.system.access(path, true),
+            _ => return ffi::SQLITE_IOERR_ACCESS,
+        };
+
+        if let Err(err) = result.and_then(|ok| {
+            let p_res_out: &mut raw::c_int = p_res_out
+                .as_mut()
+                .ok_or_else(|| std::io::Error::new(ErrorKind::Other, "received null pointer"))?;
+            *p_res_out = ok as i32;
+            Ok(())
+        }) {
+            return state.set_last_error(ffi::SQLITE_IOERR_ACCESS, err);
+        }
+
         ffi::SQLITE_OK
     }
 
@@ -191,6 +319,45 @@ mod fs {
         n_out: raw::c_int,
         z_out: *mut raw::c_char,
     ) -> raw::c_int {
+        let state = match underlying_state::<F>(p_vfs) {
+            Some(s) => s,
+            None => return ffi::SQLITE_ERROR,
+        };
+
+        let path = match CStr::from_ptr(z_path).to_str() {
+            Ok(name) => name,
+            Err(_) => {
+                return state.set_last_error(
+                    ffi::SQLITE_ERROR,
+                    std::io::Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "full_pathname failed: database must be valid utf8 (received: {:?})",
+                            CStr::from_ptr(z_path)
+                        ),
+                    ),
+                )
+            }
+        };
+
+        let name = match state.system.full_pathname(path).and_then(|name| {
+            CString::new(name.to_string()).map_err(|_| {
+                std::io::Error::new(ErrorKind::Other, "name must not contain a nul byte")
+            })
+        }) {
+            Ok(name) => name,
+            Err(err) => return state.set_last_error(ffi::SQLITE_ERROR, err),
+        };
+
+        let name = name.to_bytes_with_nul();
+        if name.len() > n_out as usize || name.len() > F::maximum_file_pathname_size() {
+            return state.set_last_error(
+                ffi::SQLITE_CANTOPEN,
+                std::io::Error::new(ErrorKind::Other, "full pathname is too long"),
+            );
+        }
+        let out = std::slice::from_raw_parts_mut(z_out as *mut u8, name.len());
+        out.copy_from_slice(name);
         ffi::SQLITE_OK
     }
     pub unsafe extern "C" fn dl_open<V>(
@@ -393,13 +560,16 @@ struct State<F: Filesystem> {
     error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
 }
 
+impl<F: Filesystem> State<F> {
+    fn set_last_error(&mut self, error_code: i32, err: std::io::Error) -> i32 {
+        *(self.error.lock().unwrap()) = Some((error_code, err));
+        error_code
+    }
+}
+
 // FIXME: Provide a return value capable of checking if it's still registered and unregistering.
 /// Registers a new virtual file system to SQLite.
-pub fn register<F: Filesystem>(
-    vfs_name: impl ToString,
-    system: F,
-    as_default: bool,
-) -> Result<(), Error> {
+pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> Result<(), Error> {
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: RUSQLITE_VFS_VERSION_IO_METHODS,
         xClose: Some(node::close::<F>),
@@ -421,10 +591,10 @@ pub fn register<F: Filesystem>(
         xFetch: None,
         xUnfetch: None,
     };
-    let name = CString::new(vfs_name.to_string().as_str())?;
-    let name_cstr = name.as_ptr();
+    let name = CString::new(vfs_name)?;
+    let name_ptr = name.as_ptr();
     let ptr = Box::into_raw(Box::new(State {
-        name: name.clone(),
+        name,
         system: Arc::new(system),
         parent: unsafe { ffi::sqlite3_vfs_find(ptr::null_mut()) },
         io: io_methods,
@@ -432,10 +602,10 @@ pub fn register<F: Filesystem>(
     }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
         iVersion: RUSQLITE_VFS_VERSION_IMPL,
-        szOsFile: F::resource_size() as raw::c_int,
+        szOsFile: std::mem::size_of::<File<F::Handle>>() as raw::c_int,
         mxPathname: F::maximum_file_pathname_size() as raw::c_int,
         pNext: ptr::null_mut(),
-        zName: name_cstr,
+        zName: name_ptr,
         pAppData: ptr as _,
         xOpen: Some(fs::open::<F>),
         xDelete: Some(fs::delete::<F>),
@@ -459,7 +629,7 @@ pub fn register<F: Filesystem>(
     if vfs_register_result != ffi::SQLITE_OK {
         return Err(Error::SqliteFailure(
             ffi::Error::new(vfs_register_result),
-            Some(format!("Failed to register the {:?} VFS.", name)),
+            Some("Failed to register the VFS.".to_string()),
         ));
     };
 
@@ -468,8 +638,12 @@ pub fn register<F: Filesystem>(
 
 #[cfg(test)]
 mod test {
+    use std::{path::PathBuf, str::FromStr};
+
     struct MockFs {}
-    struct MockHandle {}
+    struct MockHandle {
+        path: PathBuf,
+    }
 
     impl super::Resource for MockHandle {}
 
@@ -482,6 +656,23 @@ mod test {
 
         fn sleep(&self, duration: std::time::Duration) -> std::time::Duration {
             todo!()
+        }
+
+        fn open(
+            &self,
+            path: String,
+            flags: crate::OpenFlags,
+        ) -> Result<Self::Handle, std::io::Error> {
+            Ok(Self::Handle {
+                path: PathBuf::from_str(&path).unwrap(),
+            })
+        }
+
+        fn temporary_name(&self) -> String {
+            std::env::temp_dir()
+                .join(format!("rusqlite-vfs-{}", std::process::id()))
+                .to_string_lossy()
+                .to_string()
         }
     }
 
