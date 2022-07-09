@@ -15,10 +15,129 @@ use std::{
 
 use crate::Error;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenOptions {
+    /// The object type that is being opened.
+    pub kind: OpenKind,
+
+    /// The access an object is opened with.
+    pub access: OpenAccess,
+
+    pub delete_on_close: bool,
+}
+
+impl OpenKind {
+    fn from_flags(flags: i32) -> Option<Self> {
+        match flags {
+            flags if flags & ffi::SQLITE_OPEN_MAIN_DB > 0 => Some(Self::MainDb),
+            flags if flags & ffi::SQLITE_OPEN_MAIN_JOURNAL > 0 => Some(Self::MainJournal),
+            flags if flags & ffi::SQLITE_OPEN_TEMP_DB > 0 => Some(Self::TempDb),
+            flags if flags & ffi::SQLITE_OPEN_TEMP_JOURNAL > 0 => Some(Self::TempJournal),
+            flags if flags & ffi::SQLITE_OPEN_TRANSIENT_DB > 0 => Some(Self::TransientDb),
+            flags if flags & ffi::SQLITE_OPEN_SUBJOURNAL > 0 => Some(Self::SubJournal),
+            flags if flags & ffi::SQLITE_OPEN_SUPER_JOURNAL > 0 => Some(Self::SuperJournal),
+            flags if flags & ffi::SQLITE_OPEN_WAL > 0 => Some(Self::Wal),
+            _ => None,
+        }
+    }
+
+    fn to_flags(self) -> i32 {
+        match self {
+            OpenKind::MainDb => ffi::SQLITE_OPEN_MAIN_DB,
+            OpenKind::MainJournal => ffi::SQLITE_OPEN_MAIN_JOURNAL,
+            OpenKind::TempDb => ffi::SQLITE_OPEN_TEMP_DB,
+            OpenKind::TempJournal => ffi::SQLITE_OPEN_TEMP_JOURNAL,
+            OpenKind::TransientDb => ffi::SQLITE_OPEN_TRANSIENT_DB,
+            OpenKind::SubJournal => ffi::SQLITE_OPEN_SUBJOURNAL,
+            OpenKind::SuperJournal => ffi::SQLITE_OPEN_SUPER_JOURNAL,
+            OpenKind::Wal => ffi::SQLITE_OPEN_WAL,
+        }
+    }
+}
+
+impl OpenAccess {
+    fn from_flags(flags: i32) -> Option<Self> {
+        match flags {
+            flags
+                if (flags & ffi::SQLITE_OPEN_CREATE > 0)
+                    && (flags & ffi::SQLITE_OPEN_EXCLUSIVE > 0) =>
+            {
+                Some(Self::CreateNew)
+            }
+            flags if flags & ffi::SQLITE_OPEN_CREATE > 0 => Some(Self::Create),
+            flags if flags & ffi::SQLITE_OPEN_READWRITE > 0 => Some(Self::Write),
+            flags if flags & ffi::SQLITE_OPEN_READONLY > 0 => Some(Self::Read),
+            _ => None,
+        }
+    }
+
+    fn to_flags(self) -> i32 {
+        match self {
+            OpenAccess::Read => ffi::SQLITE_OPEN_READONLY,
+            OpenAccess::Write => ffi::SQLITE_OPEN_READWRITE,
+            OpenAccess::Create => ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+            OpenAccess::CreateNew => {
+                ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_EXCLUSIVE
+            }
+        }
+    }
+}
+
+impl OpenOptions {
+    fn from_flags(flags: i32) -> Option<Self> {
+        Some(OpenOptions {
+            kind: OpenKind::from_flags(flags)?,
+            access: OpenAccess::from_flags(flags)?,
+            delete_on_close: flags & ffi::SQLITE_OPEN_DELETEONCLOSE > 0,
+        })
+    }
+
+    fn to_flags(&self) -> i32 {
+        self.kind.to_flags()
+            | self.access.to_flags()
+            | if self.delete_on_close {
+                ffi::SQLITE_OPEN_DELETEONCLOSE
+            } else {
+                0
+            }
+    }
+}
+
+/// The access an object is opened with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpenAccess {
+    /// Read access.
+    Read,
+
+    /// Write access (includes read access).
+    Write,
+
+    /// Create the file if it does not exist (includes write and read access).
+    Create,
+
+    /// Create the file, but throw if it it already exist (includes write and read access).
+    CreateNew,
+}
+
+/// The object type that is being opened.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpenKind {
+    MainDb,
+    MainJournal,
+    TempDb,
+    TempJournal,
+    TransientDb,
+    SubJournal,
+    SuperJournal,
+    Wal,
+}
+
 #[repr(C)]
-pub struct File<R: Resource> {
+pub struct File<F: Filesystem> {
     base: ffi::sqlite3_file,
-    resource: R,
+    filesystem: Arc<F>,
+    resource: F::Handle,
+    database_name: String,
 }
 
 pub trait Resource: Sync {}
@@ -48,7 +167,7 @@ pub trait Filesystem: Sync {
 
     fn sleep(&self, duration: Duration) -> Duration;
 
-    fn open(&self, path: String, flags: crate::OpenFlags) -> Result<Self::Handle, std::io::Error>;
+    fn open(&self, path: String, flags: OpenOptions) -> Result<Self::Handle, std::io::Error>;
 
     fn temporary_name(&self) -> String;
 }
@@ -63,12 +182,19 @@ unsafe fn underlying_state<'a, F: Filesystem>(
     (vfs.pAppData as *mut State<F>).as_mut()
 }
 
-mod node {
-    use std::io::ErrorKind;
+unsafe fn underlying_resource<'a, F: Filesystem>(
+    ptr: *mut ffi::sqlite3_file,
+) -> Option<&'a mut F::Handle> {
+    let file: &mut ffi::sqlite3_file = ptr.as_mut()?;
+    None
+}
 
+mod node {
     use super::*;
 
     pub unsafe extern "C" fn close<F: Filesystem>(p_file: *mut ffi::sqlite3_file) -> raw::c_int {
+        if let Some(state) = underlying_resource::<F>(p_file) {}
+
         ffi::SQLITE_OK
     }
 
@@ -78,20 +204,20 @@ mod node {
         i_amt: raw::c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> raw::c_int {
-        let state = match underlying_state::<F>(p_vfs) {
+        let state = match underlying_resource::<F>(p_file) {
             Some(s) => s,
             None => return ffi::SQLITE_ERROR,
         };
 
-        let out = slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
-        if let Err(err) = state..read_exact_at(out, i_ofst as u64) {
-            let kind = err.kind();
-            if kind == ErrorKind::UnexpectedEof {
-                return ffi::SQLITE_IOERR_SHORT_READ;
-            } else {
-                return state.set_last_error(ffi::SQLITE_IOERR_READ, err);
-            }
-        }
+        let out = std::slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
+        // if let Err(err) = state.read_bytes(out, i_ofst as u64) {
+        //     let kind = err.kind();
+        //     if kind == ErrorKind::UnexpectedEof {
+        //         return ffi::SQLITE_IOERR_SHORT_READ;
+        //     } else {
+        //         return state.set_last_error(ffi::SQLITE_IOERR_READ, err);
+        //     }
+        // }
 
         ffi::SQLITE_OK
     }
@@ -223,9 +349,7 @@ mod fs {
             }
         };
 
-        println!("omg {:?}", name);
-
-        let opts = match crate::OpenFlags::from_bits(flags) {
+        let opts = match OpenOptions::from_flags(flags) {
             Some(opts) => opts,
             None => {
                 return state.set_last_error(
@@ -235,7 +359,7 @@ mod fs {
             }
         };
 
-        let out_file = match (p_file as *mut File<F::Handle>).as_mut() {
+        let out_file = match (p_file as *mut File<F>).as_mut() {
             Some(f) => f,
             None => {
                 return state.set_last_error(
@@ -245,8 +369,11 @@ mod fs {
             }
         };
 
-        let usable_name = name.map_or_else(|| state.system.temporary_name(), String::from);
-        let filesystem_resource_handle = match state.system.open(usable_name, opts) {
+        let usable_name = name
+            .clone()
+            .map_or_else(|| state.system.temporary_name(), String::from);
+        let filesystem_resource_handle = match state.system.open(usable_name.clone(), opts.clone())
+        {
             Ok(resource) => resource,
             Err(err) => {
                 state.set_last_error(ffi::SQLITE_CANTOPEN, dbg!(err));
@@ -255,10 +382,11 @@ mod fs {
         };
 
         if let Some(p_out_flags) = p_out_flags.as_mut() {
-            *p_out_flags = opts.bits();
+            *p_out_flags = opts.to_flags();
         }
 
         out_file.base.pMethods = &state.io;
+        out_file.database_name = usable_name;
         out_file.resource = filesystem_resource_handle;
 
         ffi::SQLITE_OK
@@ -573,7 +701,7 @@ pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> R
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: RUSQLITE_VFS_VERSION_IO_METHODS,
         xClose: Some(node::close::<F>),
-        xRead: Some(node::read),
+        xRead: Some(node::read::<F>),
         xWrite: Some(node::write),
         xTruncate: Some(node::truncate),
         xSync: Some(node::sync),
@@ -602,7 +730,7 @@ pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> R
     }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
         iVersion: RUSQLITE_VFS_VERSION_IMPL,
-        szOsFile: std::mem::size_of::<File<F::Handle>>() as raw::c_int,
+        szOsFile: std::mem::size_of::<File<F>>() as raw::c_int,
         mxPathname: F::maximum_file_pathname_size() as raw::c_int,
         pNext: ptr::null_mut(),
         zName: name_ptr,
@@ -640,6 +768,8 @@ pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> R
 mod test {
     use std::{path::PathBuf, str::FromStr};
 
+    use super::OpenOptions;
+
     struct MockFs {}
     struct MockHandle {
         path: PathBuf,
@@ -658,11 +788,7 @@ mod test {
             todo!()
         }
 
-        fn open(
-            &self,
-            path: String,
-            flags: crate::OpenFlags,
-        ) -> Result<Self::Handle, std::io::Error> {
+        fn open(&self, path: String, flags: OpenOptions) -> Result<Self::Handle, std::io::Error> {
             Ok(Self::Handle {
                 path: PathBuf::from_str(&path).unwrap(),
             })
