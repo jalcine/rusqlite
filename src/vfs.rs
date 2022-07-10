@@ -7,15 +7,17 @@ use libsqlite3_sys as ffi;
 use std::{
     borrow::Cow,
     ffi::CString,
-    io::{Read, Write},
-    os::{linux::fs::MetadataExt, raw},
-    path::{Path, PathBuf},
+    io::Write,
+    os::raw,
     ptr,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use crate::Error;
+
+static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 1;
+static RUSQLITE_VFS_VERSION_IMPL: i32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenOptions {
@@ -159,6 +161,8 @@ pub struct File<F: Filesystem> {
     resource: F::Handle,
     database_name: String,
     state: State<F>,
+    wal_persistence: bool,
+    powersafe_overwrite: bool,
 }
 
 impl<F: Filesystem> File<F> {
@@ -181,6 +185,14 @@ pub trait Resource: Sync {
     fn write_bytes(&mut self, buffer: &[u8], offset: usize) -> std::io::Result<()>;
 
     fn file_size(&self) -> std::io::Result<usize>;
+
+    fn has_moved(&self) -> std::io::Result<bool>;
+
+    fn lock_state(&self) -> std::io::Result<LockState>;
+
+    fn set_lock_state(&mut self, new_lock_state: LockState) -> std::io::Result<()>;
+
+    fn close(&mut self) -> std::io::Result<()>;
 }
 
 pub trait Filesystem: Sync {
@@ -213,8 +225,87 @@ pub trait Filesystem: Sync {
     fn temporary_name(&self) -> String;
 }
 
-static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 1;
-static RUSQLITE_VFS_VERSION_IMPL: i32 = 1;
+/// The access an object is opened with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockState {
+    /// No locks are held. The database may be neither read nor written. Any internally cached data
+    /// is considered suspect and subject to verification against the database file before being
+    /// used. Other processes can read or write the database as their own locking states permit.
+    /// This is the default state.
+    None,
+
+    /// The database may be read but not written. Any number of processes can hold
+    /// [LockKind::Shared] locks at the same time, hence there can be many simultaneous readers. But
+    /// no other thread or process is allowed to write to the database file while one or more
+    /// [LockKind::Shared] locks are active.
+    Shared,
+
+    /// A [LockKind::Reserved] lock means that the process is planning on writing to the database
+    /// file at some point in the future but that it is currently just reading from the file. Only a
+    /// single [LockKind::Reserved] lock may be active at one time, though multiple
+    /// [LockKind::Shared] locks can coexist with a single [LockKind::Reserved] lock.
+    /// [LockKind::Reserved] differs from [LockKind::Pending] in that new [LockKind::Shared] locks
+    /// can be acquired while there is a [LockKind::Reserved] lock.
+    Reserved,
+
+    /// A [LockKind::Pending] lock means that the process holding the lock wants to write to the
+    /// database as soon as possible and is just waiting on all current [LockKind::Shared] locks to
+    /// clear so that it can get an [LockKind::Exclusive] lock. No new [LockKind::Shared] locks are
+    /// permitted against the database if a [LockKind::Pending] lock is active, though existing
+    /// [LockKind::Shared] locks are allowed to continue.
+    Pending,
+
+    /// An [LockKind::Exclusive] lock is needed in order to write to the database file. Only one
+    /// [LockKind::Exclusive] lock is allowed on the file and no other locks of any kind are allowed
+    /// to coexist with an [LockKind::Exclusive] lock. In order to maximize concurrency, SQLite
+    /// works to minimize the amount of time that [LockKind::Exclusive] locks are held.
+    Exclusive,
+}
+
+impl From<i32> for LockState {
+    fn from(lock: i32) -> Self {
+        match lock {
+            ffi::SQLITE_LOCK_NONE => Self::None,
+            ffi::SQLITE_LOCK_SHARED => Self::Shared,
+            ffi::SQLITE_LOCK_RESERVED => Self::Reserved,
+            ffi::SQLITE_LOCK_PENDING => Self::Pending,
+            ffi::SQLITE_LOCK_EXCLUSIVE => Self::Exclusive,
+            _ => Self::None,
+        }
+    }
+}
+
+impl Into<i32> for LockState {
+    fn into(self) -> i32 {
+        match self {
+            Self::None => ffi::SQLITE_LOCK_NONE,
+            Self::Shared => ffi::SQLITE_LOCK_SHARED,
+            Self::Reserved => ffi::SQLITE_LOCK_RESERVED,
+            Self::Pending => ffi::SQLITE_LOCK_PENDING,
+            Self::Exclusive => ffi::SQLITE_LOCK_EXCLUSIVE,
+        }
+    }
+}
+
+impl PartialOrd for LockState {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let selfi: i32 = (*self).into();
+        let otheri = (*other).into();
+        selfi.partial_cmp(&otheri)
+    }
+}
+
+impl Default for LockState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl LockState {
+    pub fn is_locked(&self) -> bool {
+        *self != Self::None
+    }
+}
 
 unsafe fn underlying_state<'a, F: Filesystem>(
     ptr: *mut ffi::sqlite3_vfs,
@@ -235,7 +326,7 @@ fn null_ptr_error() -> std::io::Error {
 }
 
 mod node {
-    use std::io::ErrorKind;
+    use std::{ffi::CStr, io::ErrorKind, mem::ManuallyDrop};
 
     use super::*;
 
@@ -243,7 +334,7 @@ mod node {
         ($f: expr) => {
             match underlying_resource::<F>($f) {
                 Some(s) => s,
-                None => return ffi::SQLITE_ERROR,
+                None => return ffi::SQLITE_IOERR_FSYNC,
             }
         };
     }
@@ -251,7 +342,14 @@ mod node {
     pub unsafe extern "C" fn close<F: Filesystem>(p_file: *mut ffi::sqlite3_file) -> raw::c_int {
         let state = get_state!(p_file);
 
-        ffi::SQLITE_OK
+        println!("[vfs::close] Closing {:?}", state.database_name);
+
+        if let Err(e) = state.resource.close() {
+            state.state.set_last_error(ffi::SQLITE_IOERR_CLOSE, e)
+        } else {
+            drop(state);
+            ffi::SQLITE_OK
+        }
     }
 
     pub unsafe extern "C" fn read<F: Filesystem>(
@@ -267,23 +365,30 @@ mod node {
             i_ofst, i_amt, state.database_name
         );
 
-        let out = std::slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
-        if let Err(err) = state.read_bytes(out, i_ofst as usize) {
+        let mut read_bytes = Vec::default();
+        if let Err(err) = state.read_bytes(&mut read_bytes, i_ofst as usize) {
             println!(
                 "[vfs::read] Read of {} bytes was unsuccessful: {:#?}.",
                 i_amt, err
             );
             let kind = err.kind();
             if kind == ErrorKind::UnexpectedEof {
+                println!("[vfs::read] short read err");
                 ffi::SQLITE_IOERR_SHORT_READ
             } else {
+                println!("[vfs::read] failed {:#?}", err);
                 return state.state.set_last_error(ffi::SQLITE_IOERR_READ, err);
             }
         } else {
+            let mut out = std::slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
+
+            if let Err(err) = out.write(&read_bytes) {
+                return state.state.set_last_error(ffi::SQLITE_IOERR_READ, err);
+            }
             println!(
                 "[vfs::read] Of the wanted {} bytes, {} were read successfully.",
                 i_amt,
-                out.len()
+                read_bytes.len()
             );
             ffi::SQLITE_OK
         }
@@ -298,8 +403,8 @@ mod node {
         let state = get_state!(p_file);
 
         println!(
-            "[vfs::write] offset={} len={} ({})",
-            i_ofst, i_amt, state.database_name
+            "[vfs::write] Writing into {} at the offset of {} with {} bytes",
+            state.database_name, i_ofst, i_amt
         );
 
         let data = std::slice::from_raw_parts(z as *mut u8, i_amt as usize);
@@ -344,11 +449,14 @@ mod node {
     ) -> raw::c_int {
         let state = get_state!(p_file);
         println!(
-            "[vfs::sync] Getting the file size of {:?}",
+            "[vfs::file_size] Getting the file size of {:?}...",
             state.database_name
         );
         if let Err(err) = state.file_size().and_then(|n| {
-            println!("[vfs::sync] Size of {:?} is {} ", state.database_name, n);
+            println!(
+                "[vfs::file_size] Size of {:?} is reporting as {} bytes.",
+                state.database_name, n
+            );
 
             let p_size: &mut ffi::sqlite3_int64 = p_size.as_mut().ok_or_else(null_ptr_error)?;
             *p_size = n as ffi::sqlite3_int64;
@@ -365,8 +473,21 @@ mod node {
         e_lock: raw::c_int,
     ) -> raw::c_int {
         let state = get_state!(p_file);
+        let lock_kind = LockState::from(e_lock as i32);
+        println!(
+            "[vfs::lock] Requesting to set the lock to the {:?} lock",
+            lock_kind
+        );
 
-        ffi::SQLITE_OK
+        set_lock(state, lock_kind)
+    }
+
+    fn set_lock<F: Filesystem>(state: &mut File<F>, lock_state: LockState) -> raw::c_int {
+        if let Err(e) = state.resource.set_lock_state(lock_state) {
+            state.state.set_last_error(ffi::SQLITE_IOERR_FSTAT, e)
+        } else {
+            ffi::SQLITE_OK
+        }
     }
 
     pub unsafe extern "C" fn unlock<F: Filesystem>(
@@ -374,13 +495,30 @@ mod node {
         e_lock: raw::c_int,
     ) -> raw::c_int {
         let state = get_state!(p_file);
-        ffi::SQLITE_OK
+        let lock_kind = LockState::from(e_lock as i32);
+        println!(
+            "[vfs::unlock] Requesting to lift the lock to a state of {:?}",
+            lock_kind
+        );
+
+        set_lock(state, lock_kind)
     }
     pub unsafe extern "C" fn check_reserved_lock<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut raw::c_int,
     ) -> raw::c_int {
         let state = get_state!(p_file);
+        println!("[vfs::check_reserved_lock] Checking the status of the current lock.");
+
+        if let Err(err) = state.resource.lock_state().and_then(|lock| {
+            let p_res_out: &mut raw::c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
+            println!("[vfs::check_reserved_lock] We have a {:?} lock", lock);
+            *p_res_out = lock.is_locked() as raw::c_int;
+            Ok(())
+        }) {
+            return state.state.set_last_error(ffi::SQLITE_IOERR_UNLOCK, err);
+        }
+
         ffi::SQLITE_OK
     }
 
@@ -390,20 +528,317 @@ mod node {
         p_arg: *mut raw::c_void,
     ) -> raw::c_int {
         let state = get_state!(p_file);
-        ffi::SQLITE_OK
+        println!(
+            "[vfs::file_size] Enacting file control on {:?} with the opcode {:?} ...",
+            state.database_name, op
+        );
+
+        // Docs: https://www.sqlite.org/c3ref/c_fcntl_begin_atomic_write.html
+        match op {
+            // The following op codes are alreay handled by sqlite before, so no need to handle them
+            // in a custom VFS.
+            ffi::SQLITE_FCNTL_FILE_POINTER
+            | ffi::SQLITE_FCNTL_VFS_POINTER
+            | ffi::SQLITE_FCNTL_JOURNAL_POINTER
+            | ffi::SQLITE_FCNTL_DATA_VERSION
+            | ffi::SQLITE_FCNTL_RESERVE_BYTES => ffi::SQLITE_NOTFOUND,
+
+            // The following op codes are no longer used and thus ignored.
+            ffi::SQLITE_FCNTL_SYNC_OMITTED => ffi::SQLITE_NOTFOUND,
+
+            // Used for debugging. Write current state of the lock into (int)pArg.
+            ffi::SQLITE_FCNTL_LOCKSTATE => {
+                // FIXME: Add logic for locking.
+                // match state.current_lock() {
+                // Ok(lock) => {
+                //     if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                //         *p_arg = lock as i32;
+                //     }
+                //     ffi::SQLITE_OK
+                // }
+                // Err(err) => state.state.set_last_error(ffi::SQLITE_ERROR, err),
+
+                // }
+                ffi::SQLITE_NOTFOUND
+            }
+
+            // Relevant for proxy-type locking. Not implemented.
+            ffi::SQLITE_FCNTL_GET_LOCKPROXYFILE | ffi::SQLITE_FCNTL_SET_LOCKPROXYFILE => {
+                ffi::SQLITE_NOTFOUND
+            }
+
+            // Write last error number into (int)pArg.
+            ffi::SQLITE_FCNTL_LAST_ERRNO => {
+                // FIXME: Store error numbers like this on the file.
+                // if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                //     *p_arg = state.last_errno;
+                // }
+                ffi::SQLITE_NOTFOUND
+            }
+
+            // Give the VFS layer a hint of how large the database file will grow to be during the
+            // current transaction.
+            ffi::SQLITE_FCNTL_SIZE_HINT => {
+                // FIXME: Come back to this.
+                /*
+                let size_hint = match (p_arg as *mut i64).as_ref().cloned().map(|s| s.abs()) {
+                    Some(chunk_size) => chunk_size,
+                    None => {
+                        return state.set_last_error(
+                            ffi::SQLITE_NOTFOUND,
+                            std::io::Error::new(ErrorKind::Other, "expect size hint arg"),
+                        );
+                    }
+                };
+
+                // #[cfg(feature = "sqlite_test")]
+                // let _benign = simulate_io_error_benign();
+
+                let current = match state.file.size() {
+                    Ok(size) => size,
+                    Err(err) => return state.set_last_error(ffi::SQLITE_ERROR, err),
+                };
+
+                if current > size_hint {
+                    return ffi::SQLITE_OK;
+                }
+
+                if let Some(chunk_size) = state.chunk_size {
+                    let chunk_size = chunk_size as u64;
+                    let size = ((size_hint + chunk_size - 1) / chunk_size) * chunk_size;
+                    if let Err(err) = state.file.set_len(size) {
+                        return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
+                    }
+                } else if let Err(err) = state.file.set_len(size_hint) {
+                    return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
+                }
+
+                // #[cfg(feature = "sqlite_test")]
+                // if simulate_io_error() {
+                //     return ffi::SQLITE_IOERR_TRUNCATE;
+                // }
+                */
+                ffi::SQLITE_NOTFOUND
+            }
+
+            // Request that the VFS extends and truncates the database file in chunks of a size
+            // specified by the user. Return an error as this is not forwarded to the [Vfs] trait
+            // right now.
+            ffi::SQLITE_FCNTL_CHUNK_SIZE => {
+                // FIXME: Come back to this.
+                /*
+                let chunk_size = match (p_arg as *mut i32)
+                    .as_ref()
+                    .cloned()
+                    .and_then(|s| usize::try_from(s).ok())
+                {
+                    Some(chunk_size) => chunk_size,
+                    None => {
+                        return state.set_last_error(
+                            ffi::SQLITE_NOTFOUND,
+                            std::io::Error::new(ErrorKind::Other, "expect chunk_size arg"),
+                        );
+                    }
+                };
+
+                if let Err(err) = state.file.set_chunk_size(chunk_size) {
+                    return state.set_last_error(ffi::SQLITE_ERROR, err);
+                }
+
+                state.chunk_size = Some(chunk_size);
+                */
+
+                ffi::SQLITE_NOTFOUND
+            }
+
+            // Configure automatic retry counts and intervals for certain disk I/O operations for
+            // the windows VFS in order to provide robustness in the presence of anti-virus
+            // programs. Not implemented. But also, Windows?
+            ffi::SQLITE_FCNTL_WIN32_AV_RETRY => ffi::SQLITE_NOTFOUND,
+
+            // Enable or disable the persistent WAL setting.
+            ffi::SQLITE_FCNTL_PERSIST_WAL => {
+                if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                    if *p_arg < 0 {
+                        // query current setting
+                        *p_arg = state.wal_persistence as i32;
+                    } else {
+                        state.wal_persistence = *p_arg == 1;
+                    }
+                };
+
+                ffi::SQLITE_OK
+            }
+
+            // Indicate that, unless it is rolled back for some reason, the entire database file
+            // will be overwritten by the current transaction. Not implemented.
+            ffi::SQLITE_FCNTL_OVERWRITE => ffi::SQLITE_NOTFOUND,
+
+            // Used to obtain the names of all VFSes in the VFS stack.
+            ffi::SQLITE_FCNTL_VFSNAME => {
+                if let Some(p_arg) = (p_arg as *mut *const raw::c_char).as_mut() {
+                    let name = ManuallyDrop::new(state.state.name.clone());
+                    *p_arg = name.as_ptr();
+                };
+
+                ffi::SQLITE_OK
+            }
+
+            // Set or query the persistent "powersafe-overwrite" or "PSOW" setting.
+            ffi::SQLITE_FCNTL_POWERSAFE_OVERWRITE => {
+                if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                    if *p_arg < 0 {
+                        // query current setting
+                        *p_arg = state.powersafe_overwrite as i32;
+                    } else {
+                        state.powersafe_overwrite = *p_arg == 1;
+                    }
+                };
+
+                ffi::SQLITE_OK
+            }
+
+            // Optionally intercept PRAGMA statements. Always fall back to normal pragma processing.
+            ffi::SQLITE_FCNTL_PRAGMA => ffi::SQLITE_NOTFOUND,
+
+            // May be invoked by SQLite on the database file handle shortly after it is opened in
+            // order to provide a custom VFS with access to the connection's busy-handler callback.
+            // Not implemented.
+            ffi::SQLITE_FCNTL_BUSYHANDLER => ffi::SQLITE_NOTFOUND,
+
+            // Generate a temporary filename. Not implemented.
+            ffi::SQLITE_FCNTL_TEMPFILENAME => {
+                if let Some(p_arg) = (p_arg as *mut *const raw::c_char).as_mut() {
+                    let name = state.filesystem.system.temporary_name();
+                    // unwrap() is fine as os strings are an arbitrary sequences of non-zero bytes
+                    let name = CString::new(name.as_bytes()).unwrap();
+                    let name = ManuallyDrop::new(name);
+                    *p_arg = name.as_ptr();
+                };
+
+                ffi::SQLITE_OK
+            }
+
+            // Query or set the maximum number of bytes that will be used for memory-mapped I/O.
+            // Not implemented.
+            ffi::SQLITE_FCNTL_MMAP_SIZE => ffi::SQLITE_NOTFOUND,
+
+            // Advisory information to the VFS about what the higher layers of the SQLite stack are
+            // doing.
+            ffi::SQLITE_FCNTL_TRACE => {
+                let trace = CStr::from_ptr(p_arg as *const raw::c_char);
+                println!("[vfs::fcntrl] Trace: {:?}", trace);
+                // log::trace!("{}", trace.to_string_lossy());
+                ffi::SQLITE_OK
+            }
+
+            // Check whether or not the file has been renamed, moved, or deleted since it was first
+            // opened.
+            ffi::SQLITE_FCNTL_HAS_MOVED => match state.resource.has_moved() {
+                Ok(moved) => {
+                    if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                        *p_arg = moved as i32;
+                    }
+                    ffi::SQLITE_OK
+                }
+                Err(err) => state.state.set_last_error(ffi::SQLITE_ERROR, err),
+            },
+
+            // Sent to the VFS immediately before the xSync method is invoked on a database file
+            // descriptor. Silently ignored.
+            ffi::SQLITE_FCNTL_SYNC => ffi::SQLITE_OK,
+
+            // Sent to the VFS after a transaction has been committed immediately but before the
+            // database is unlocked. Silently ignored.
+            ffi::SQLITE_FCNTL_COMMIT_PHASETWO => ffi::SQLITE_OK,
+
+            // Used for debugging. Swap the file handle with the one pointed to by the pArg
+            // argument. This capability is used during testing and only needs to be supported when
+            // SQLITE_TEST is defined. Not implemented.
+            ffi::SQLITE_FCNTL_WIN32_SET_HANDLE => ffi::SQLITE_NOTFOUND,
+
+            // Signal to the VFS layer that it might be advantageous to block on the next WAL lock
+            // if the lock is not immediately available. The WAL subsystem issues this signal during
+            // rare circumstances in order to fix a problem with priority inversion.
+            // Not implemented.
+            ffi::SQLITE_FCNTL_WAL_BLOCK => ffi::SQLITE_NOTFOUND,
+
+            // Implemented by zipvfs only.
+            ffi::SQLITE_FCNTL_ZIPVFS => ffi::SQLITE_NOTFOUND,
+
+            // Implemented by the special VFS used by the RBU extension only.
+            ffi::SQLITE_FCNTL_RBU => ffi::SQLITE_NOTFOUND,
+
+            // Obtain the underlying native file handle associated with a file handle.
+            // Not implemented.
+            ffi::SQLITE_FCNTL_WIN32_GET_HANDLE => ffi::SQLITE_NOTFOUND,
+
+            // Usage is not documented. Not implemented.
+            ffi::SQLITE_FCNTL_PDB => ffi::SQLITE_NOTFOUND,
+
+            // Used for "batch write mode". Not supported.
+            ffi::SQLITE_FCNTL_BEGIN_ATOMIC_WRITE
+            | ffi::SQLITE_FCNTL_COMMIT_ATOMIC_WRITE
+            | ffi::SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE => ffi::SQLITE_NOTFOUND,
+
+            // Configure a VFS to block for up to M milliseconds before failing when attempting to
+            // obtain a file lock using the xLock or xShmLock methods of the VFS. Not implemented.
+            ffi::SQLITE_FCNTL_LOCK_TIMEOUT => ffi::SQLITE_NOTFOUND,
+
+            // Used by in-memory VFS.
+            ffi::SQLITE_FCNTL_SIZE_LIMIT => ffi::SQLITE_NOTFOUND,
+
+            // Invoked from within a checkpoint in wal mode after the client has finished copying
+            // pages from the wal file to the database file, but before the *-shm file is updated to
+            // record the fact that the pages have been checkpointed. Silently ignored.
+            ffi::SQLITE_FCNTL_CKPT_DONE => ffi::SQLITE_OK,
+
+            // Invoked from within a checkpoint in wal mode before the client starts to copy pages
+            // from the wal file to the database file. Silently ignored.
+            ffi::SQLITE_FCNTL_CKPT_START => ffi::SQLITE_OK,
+
+            // Detect whether or not there is a database client in another process with a wal-mode
+            // transaction open on the database or not. Not implemented because it is a
+            // unix-specific feature.
+            ffi::SQLITE_FCNTL_EXTERNAL_READER => ffi::SQLITE_NOTFOUND,
+
+            // Unknown use-case. Ignored.
+            ffi::SQLITE_FCNTL_CKSM_FILE => ffi::SQLITE_NOTFOUND,
+
+            _ => ffi::SQLITE_NOTFOUND,
+        }
     }
 
     pub unsafe extern "C" fn sector_size<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
     ) -> raw::c_int {
         let state = get_state!(p_file);
+        println!(
+            "[vfs::file_size] Size of a sector in {:?}",
+            state.database_name
+        );
+
+        // FIXME: This should be a true bit vector.
         1024
     }
     pub unsafe extern "C" fn device_characteristics<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
     ) -> raw::c_int {
         let state = get_state!(p_file);
-        ffi::SQLITE_OK
+
+        println!(
+            "[vfs::file_size] Fetching the device characteristics of the system that {:#?} lives on.",
+            state.database_name
+        );
+
+        // after reboot following a crash or power loss, the only bytes in a file that were written
+        // at the application level might have changed and that adjacent bytes, even bytes within
+        // the same sector are guaranteed to be unchanged
+        if state.powersafe_overwrite {
+            ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE
+        } else {
+            0
+        }
     }
     pub unsafe extern "C" fn shm_map<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
@@ -413,6 +848,7 @@ mod node {
         pp: *mut *mut raw::c_void,
     ) -> raw::c_int {
         let state = get_state!(p_file);
+        println!("shm:map");
         ffi::SQLITE_OK
     }
 
@@ -423,11 +859,13 @@ mod node {
         flags: raw::c_int,
     ) -> raw::c_int {
         let state = get_state!(p_file);
+        println!("shm:lock");
         ffi::SQLITE_OK
     }
 
     pub unsafe extern "C" fn shm_barrier<F: Filesystem>(p_file: *mut ffi::sqlite3_file) {
         let _state = underlying_resource::<F>(p_file);
+        println!("shm:barrier");
     }
 
     pub unsafe extern "C" fn shm_unmap<F: Filesystem>(
@@ -435,6 +873,7 @@ mod node {
         delete_flags: raw::c_int,
     ) -> raw::c_int {
         let state = get_state!(p_file);
+        println!("shm:unmap");
         ffi::SQLITE_OK
     }
 }
@@ -467,6 +906,12 @@ mod fs {
     use super::*;
 
     macro_rules! get_state {
+        ($f: expr, $exit_code: expr) => {
+            match underlying_state::<F>($f) {
+                Some(s) => s,
+                None => return $exit_code,
+            }
+        };
         ($f: expr) => {
             match underlying_state::<F>($f) {
                 Some(s) => s,
@@ -569,7 +1014,7 @@ mod fs {
         z_path: *const raw::c_char,
         _sync_dir: raw::c_int,
     ) -> raw::c_int {
-        let state = get_state!(p_vfs);
+        let state = get_state!(p_vfs, ffi::SQLITE_DELETE);
         let path = from_cstr!(
             state,
             z_path,
@@ -620,10 +1065,10 @@ mod fs {
             *p_res_out = ok as i32;
             Ok(())
         }) {
-            return state.set_last_error(ffi::SQLITE_IOERR_ACCESS, err);
+            state.set_last_error(ffi::SQLITE_IOERR_ACCESS, err)
+        } else {
+            ffi::SQLITE_OK
         }
-
-        ffi::SQLITE_OK
     }
 
     pub unsafe extern "C" fn full_pathname<F: Filesystem>(
@@ -792,54 +1237,55 @@ mod fs {
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn set_system_call<F: Filesystem>(
-        p_vfs: *mut ffi::sqlite3_vfs,
-        z_name: *const ::std::os::raw::c_char,
-        p_new_func: ffi::sqlite3_syscall_ptr,
-    ) -> ::std::os::raw::c_int {
-        let state = match underlying_state::<F>(p_vfs) {
-            Some(state) => state,
-            None => return ffi::SQLITE_ERROR,
-        };
+    // FIXME: This is part of v2 of the vfs object.
+    //     pub unsafe extern "C" fn set_system_call<F: Filesystem>(
+    //         p_vfs: *mut ffi::sqlite3_vfs,
+    //         z_name: *const ::std::os::raw::c_char,
+    //         p_new_func: ffi::sqlite3_syscall_ptr,
+    //     ) -> ::std::os::raw::c_int {
+    //         let state = match underlying_state::<F>(p_vfs) {
+    //             Some(state) => state,
+    //             None => return ffi::SQLITE_ERROR,
+    //         };
 
-        if let Some(set_system_call) = state.parent.as_ref().and_then(|v| v.xSetSystemCall) {
-            return set_system_call(state.parent, z_name, p_new_func);
-        }
+    //         if let Some(set_system_call) = state.parent.as_ref().and_then(|v| v.xSetSystemCall) {
+    //             return set_system_call(state.parent, z_name, p_new_func);
+    //         }
 
-        ffi::SQLITE_ERROR
-    }
+    //         ffi::SQLITE_ERROR
+    //     }
 
-    pub unsafe extern "C" fn get_system_call<F: Filesystem>(
-        p_vfs: *mut ffi::sqlite3_vfs,
-        z_name: *const ::std::os::raw::c_char,
-    ) -> ffi::sqlite3_syscall_ptr {
-        let state = match underlying_state::<F>(p_vfs) {
-            Some(state) => state,
-            None => return None,
-        };
+    //     pub unsafe extern "C" fn get_system_call<F: Filesystem>(
+    //         p_vfs: *mut ffi::sqlite3_vfs,
+    //         z_name: *const ::std::os::raw::c_char,
+    //     ) -> ffi::sqlite3_syscall_ptr {
+    //         let state = match underlying_state::<F>(p_vfs) {
+    //             Some(state) => state,
+    //             None => return None,
+    //         };
 
-        if let Some(get_system_call) = state.parent.as_ref().and_then(|v| v.xGetSystemCall) {
-            return get_system_call(state.parent, z_name);
-        }
+    //         if let Some(get_system_call) = state.parent.as_ref().and_then(|v| v.xGetSystemCall) {
+    //             return get_system_call(state.parent, z_name);
+    //         }
 
-        None
-    }
+    //         None
+    //     }
 
-    pub unsafe extern "C" fn next_system_call<F: Filesystem>(
-        p_vfs: *mut ffi::sqlite3_vfs,
-        z_name: *const ::std::os::raw::c_char,
-    ) -> *const ::std::os::raw::c_char {
-        if let Some(state) = underlying_state::<F>(p_vfs) {
-            state
-                .parent
-                .as_ref()
-                .and_then(|v| v.xNextSystemCall)
-                .map(|c| c(state.parent, z_name))
-                .unwrap_or(ptr::null())
-        } else {
-            ptr::null()
-        }
-    }
+    //     pub unsafe extern "C" fn next_system_call<F: Filesystem>(
+    //         p_vfs: *mut ffi::sqlite3_vfs,
+    //         z_name: *const ::std::os::raw::c_char,
+    //     ) -> *const ::std::os::raw::c_char {
+    //         if let Some(state) = underlying_state::<F>(p_vfs) {
+    //             state
+    //                 .parent
+    //                 .as_ref()
+    //                 .and_then(|v| v.xNextSystemCall)
+    //                 .map(|c| c(state.parent, z_name))
+    //                 .unwrap_or(ptr::null())
+    //         } else {
+    //             ptr::null()
+    //         }
+    //     }
 
     pub unsafe extern "C" fn get_last_error<F: Filesystem>(
         p_vfs: *mut ffi::sqlite3_vfs,
@@ -901,10 +1347,10 @@ pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> R
         xFileControl: Some(node::file_control::<F>),
         xSectorSize: Some(node::sector_size::<F>),
         xDeviceCharacteristics: Some(node::device_characteristics::<F>),
-        xShmMap: Some(node::shm_map::<F>),
-        xShmLock: Some(node::shm_lock::<F>),
-        xShmBarrier: Some(node::shm_barrier::<F>),
-        xShmUnmap: Some(node::shm_unmap::<F>),
+        xShmMap: None,
+        xShmLock: None,
+        xShmBarrier: None,
+        xShmUnmap: None,
         xFetch: None,
         xUnfetch: None,
     };
@@ -937,9 +1383,9 @@ pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> R
         xCurrentTime: Some(fs::current_time::<F>),
         xGetLastError: Some(fs::get_last_error::<F>),
         xCurrentTimeInt64: Some(fs::current_time_i64::<F>),
-        xSetSystemCall: Some(fs::set_system_call::<F>),
-        xGetSystemCall: Some(fs::get_system_call::<F>),
-        xNextSystemCall: Some(fs::next_system_call::<F>),
+        xSetSystemCall: None,
+        xGetSystemCall: None,
+        xNextSystemCall: None,
     }));
 
     let vfs_register_result = unsafe { ffi::sqlite3_vfs_register(vfs, as_default as raw::c_int) };
@@ -948,138 +1394,7 @@ pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> R
             ffi::Error::new(vfs_register_result),
             Some("Failed to register the VFS.".to_string()),
         ));
-    };
-
-    Ok(())
-}
-
-struct OsFs {}
-struct OsHandle {
-    file: std::fs::File,
-}
-
-impl Resource for OsHandle {
-    fn read_bytes(&mut self, buffer: &mut [u8], offset: usize) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom};
-        self.file.seek(SeekFrom::Start(offset as u64))?;
-        self.file.read(buffer).and(Ok(()))
-    }
-
-    fn write_bytes(&mut self, buffer: &[u8], offset: usize) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom};
-        self.file.seek(SeekFrom::Start(offset as u64))?;
-        self.file.write_all(buffer)
-    }
-
-    fn file_size(&self) -> std::io::Result<usize> {
-        self.file.metadata().map(|m| m.st_size() as usize)
-    }
-}
-
-impl Filesystem for OsFs {
-    type Handle = OsHandle;
-
-    fn random_bytes(&self, _buffer: &mut [i8]) {}
-
-    fn sleep(&self, duration: Duration) -> Duration {
-        std::thread::sleep(duration);
-        duration
-    }
-
-    fn open(&self, path: String, flags: OpenOptions) -> Result<Self::Handle, std::io::Error> {
-        let flags: std::fs::OpenOptions = flags.access.into();
-        let file = flags.open(path)?;
-
-        Ok(Self::Handle { file })
-    }
-
-    fn temporary_name(&self) -> String {
-        todo!()
-    }
-
-    fn full_pathname<'a>(&self, pathname: &'a str) -> Result<Cow<'a, str>, std::io::Error> {
-        Path::new(pathname)
-            .canonicalize()
-            .map(|s| s.to_path_buf())
-            .map(|s| Cow::Owned(s.to_string_lossy().to_string()))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, Box::new(e)))
-    }
-
-    fn delete(&self, path: String) -> std::io::Result<()> {
-        std::fs::remove_file(path)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::OsFs;
-
-    #[test]
-    fn registers() {
-        use super::register;
-
-        let register_result = register("test-vfs", OsFs {}, false);
-        assert!(register_result.is_ok());
-    }
-
-    #[test]
-    fn generates_schema() {
-        use super::register;
-        let mock_fs = OsFs {};
-
-        let register_result = register("test-vfs", mock_fs, false);
-        assert_eq!(
-            register_result.as_ref().err(),
-            None,
-            "registered vfs safely"
-        );
-
-        let conn_result = crate::Connection::open_with_flags_and_vfs(
-            "./test.sqlite",
-            crate::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            "test-vfs",
-        );
-
-        assert_eq!(conn_result.as_ref().err(), None, "connection was opened");
-
-        let conn = conn_result.unwrap();
-
-        assert_eq!(
-            conn.execute(
-                r#"
-                    CREATE TABLE person (
-                        id      INTEGER PRIMARY KEY,
-                        name    TEXT NOT NULL,
-                        data    BLOB
-                    );
-                "#,
-                []
-            )
-            .err(),
-            None,
-            "creates a table"
-        );
-
-        assert_eq!(
-            conn.execute(
-                "INSERT INTO person (name, data) VALUES (?1, ?2)",
-                crate::params!["Frederick Douglass".to_string(), Some(Vec::default())],
-            )
-            .err(),
-            None,
-            "no errors when inserting records"
-        );
-
-        let stmt_result = conn.prepare("SELECT id, name, data FROM person");
-        assert_eq!(stmt_result.as_ref().err(), None, "can build statements");
-        let mut stmt = stmt_result.unwrap();
-
-        let person_iter_result = stmt.query_map(crate::NO_PARAMS, |row| row.get::<usize, u8>(0));
-        assert_eq!(person_iter_result.as_ref().err(), None, "can get rows out");
-        let person_iter = person_iter_result.unwrap();
-
-        for person in person_iter {
-            println!("Found person {:?}", person.unwrap());
-        }
+    } else {
+        Ok(())
     }
 }
