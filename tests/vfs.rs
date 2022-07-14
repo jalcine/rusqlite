@@ -16,6 +16,7 @@ mod vfs_test {
         io::{BufReader, Read, Seek, Write},
         os::linux::fs::MetadataExt,
         path::{Path, PathBuf},
+        sync::Arc,
         time::Duration,
     };
 
@@ -24,10 +25,10 @@ mod vfs_test {
     }
 
     impl OsFs {
-        pub fn new() -> std::io::Result<Self> {
-            Ok(OsFs {
+        pub fn new() -> std::io::Result<Arc<Self>> {
+            Ok(Arc::new(OsFs {
                 tempdir: tempdir()?,
-            })
+            }))
         }
     }
 

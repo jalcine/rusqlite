@@ -1313,7 +1313,11 @@ impl<F: Filesystem> State<F> {
 
 // FIXME: Provide a return value capable of checking if it's still registered and unregistering.
 /// Registers a new virtual file system to SQLite.
-pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> Result<(), Error> {
+pub fn register<F: Filesystem>(
+    vfs_name: &str,
+    system: Arc<F>,
+    as_default: bool,
+) -> Result<(), Error> {
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: RUSQLITE_VFS_VERSION_IO_METHODS,
         xClose: Some(node::close::<F>),
@@ -1339,7 +1343,7 @@ pub fn register<F: Filesystem>(vfs_name: &str, system: F, as_default: bool) -> R
     let name_ptr = name.as_ptr();
     let ptr = Box::into_raw(Box::new(State {
         name,
-        system: Arc::new(system),
+        system: Arc::clone(&system),
         parent: unsafe { ffi::sqlite3_vfs_find(ptr::null_mut()) },
         io: io_methods,
         error: Arc::new(Default::default()),
