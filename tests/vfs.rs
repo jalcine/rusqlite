@@ -7,9 +7,11 @@ mod vfs_test {
         vfs::{register, Filesystem, LockState, OpenOptions, Resource},
         OpenFlags,
     };
+    use tempfile::{tempdir, TempDir};
 
     use std::{
         borrow::Cow,
+        ffi::OsStr,
         fs::File,
         io::{BufReader, Read, Seek, Write},
         os::linux::fs::MetadataExt,
@@ -17,7 +19,18 @@ mod vfs_test {
         time::Duration,
     };
 
-    struct OsFs {}
+    struct OsFs {
+        tempdir: TempDir,
+    }
+
+    impl OsFs {
+        pub fn new() -> std::io::Result<Self> {
+            Ok(OsFs {
+                tempdir: tempdir()?,
+            })
+        }
+    }
+
     struct OsHandle {
         flags: std::fs::OpenOptions,
         path: String,
@@ -127,8 +140,24 @@ mod vfs_test {
             })
         }
 
-        fn temporary_name(&self) -> String {
-            "foobar".to_string()
+        fn temporary_filename(&self) -> std::io::Result<String> {
+            let temp_file = tempfile::Builder::new()
+                .prefix("rusqlite-vfs-osfs")
+                .rand_bytes(8)
+                .tempfile()?;
+
+            let temp_file_name = temp_file.path().file_name();
+
+            temp_file_name
+                .and_then(OsStr::to_str)
+                .map(|s| s.to_string())
+                .ok_or(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "failed to generate a new temporary file at {:?}",
+                        temp_file_name
+                    ),
+                ))
         }
 
         fn full_pathname<'a>(&self, pathname: &'a str) -> Result<Cow<'a, str>, std::io::Error> {
@@ -162,6 +191,10 @@ mod vfs_test {
                     std::fs::metadata(path).map(|m| !m.permissions().readonly())
                 }
             }
+        }
+
+        fn sector_size() -> usize {
+            16
         }
     }
 
@@ -197,13 +230,13 @@ mod vfs_test {
 
     #[test]
     fn registers() {
-        let register_result = register("test-vfs", OsFs {}, false);
+        let register_result = register("test-vfs", OsFs::new().expect("failed to expect"), false);
         assert!(register_result.is_ok());
     }
 
     #[test]
-    fn generates_schema() {
-        let mock_fs = OsFs {};
+    fn generates_schema_on_disk() {
+        let mock_fs = OsFs::new().expect("failed to expect");
 
         let register_result = register("test-vfs", mock_fs, false);
         assert_eq!(
@@ -213,7 +246,7 @@ mod vfs_test {
         );
 
         let conn_result = rusqlite::Connection::open_with_flags_and_vfs(
-            "file:test.sqlite",
+            "file:test.sqlite?wal=off",
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             "test-vfs",
         );
@@ -225,7 +258,7 @@ mod vfs_test {
         assert_eq!(
             conn.execute(
                 r#"
-                    CREATE TABLE person (
+                    CREATE TABLE IF NOT EXISTS person (
                         id      INTEGER PRIMARY KEY,
                         name    TEXT NOT NULL,
                         data    BLOB
@@ -262,5 +295,88 @@ mod vfs_test {
         for person in person_iter {
             println!("Found person {:?}", person.unwrap());
         }
+
+        assert_eq!(
+            conn.execute(
+                "ALTER TABLE person ADD COLUMN age INTEGER NOT NULL DEFAULT 18;",
+                rusqlite::params![],
+            )
+            .err(),
+            None,
+            "inserting records"
+        );
+    }
+
+    #[test]
+    fn generates_schema_with_in_memory() {
+        let mock_fs = OsFs::new().expect("failed to expect");
+
+        let register_result = register("test-vfs", mock_fs, false);
+        assert_eq!(
+            register_result.as_ref().err(),
+            None,
+            "registered vfs safely"
+        );
+
+        let conn_result = rusqlite::Connection::open_with_flags_and_vfs(
+            ":memory:",
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            "test-vfs",
+        );
+
+        assert_eq!(conn_result.as_ref().err(), None, "connection was opened");
+
+        let conn = conn_result.unwrap();
+
+        assert_eq!(
+            conn.execute(
+                r#"
+                    CREATE TABLE IF NOT EXISTS person (
+                        id      INTEGER PRIMARY KEY,
+                        name    TEXT NOT NULL,
+                        data    BLOB
+                    );
+                "#,
+                []
+            )
+            .err(),
+            // .as_ref()
+            // .and_then(|e| e.sqlite_error())
+            // .map(|e| unsafe { CStr::from_ptr(sqlite3_errstr(e.extended_code)) }),
+            None,
+            "creates a table"
+        );
+
+        assert_eq!(
+            conn.execute(
+                "INSERT INTO person (name, data) VALUES (?1, ?2)",
+                rusqlite::params!["Frederick Douglass".to_string(), Some(Vec::default())],
+            )
+            .err(),
+            None,
+            "inserting records"
+        );
+
+        let stmt_result = conn.prepare("SELECT id, name, data FROM person");
+        assert_eq!(stmt_result.as_ref().err(), None, "can build statements");
+        let mut stmt = stmt_result.unwrap();
+
+        let person_iter_result = stmt.query_map(rusqlite::NO_PARAMS, |row| row.get::<usize, u8>(0));
+        assert_eq!(person_iter_result.as_ref().err(), None, "can get rows out");
+        let person_iter = person_iter_result.unwrap();
+
+        for person in person_iter {
+            println!("Found person {:?}", person.unwrap());
+        }
+
+        assert_eq!(
+            conn.execute(
+                "ALTER TABLE person ADD COLUMN age INTEGER NOT NULL DEFAULT 18;",
+                rusqlite::params![],
+            )
+            .err(),
+            None,
+            "inserting records"
+        );
     }
 }

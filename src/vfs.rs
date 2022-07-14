@@ -16,8 +16,8 @@ use std::{
 
 use crate::Error;
 
-static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 2;
-static RUSQLITE_VFS_VERSION_IMPL: i32 = 2;
+static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 3;
+static RUSQLITE_VFS_VERSION_IMPL: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenOptions {
@@ -177,6 +177,9 @@ impl<F: Filesystem> File<F> {
     pub fn file_size(&self) -> std::io::Result<usize> {
         self.resource.file_size()
     }
+    pub fn sector_size(&self) -> usize {
+        F::sector_size()
+    }
 }
 
 pub trait Resource: Sync {
@@ -210,6 +213,8 @@ pub trait Filesystem: Sync {
         1024
     }
 
+    fn sector_size() -> usize;
+
     /// Check access to `db`. The default implementation always returns `true`.
     fn exists(&self, path: &str) -> std::io::Result<bool>;
 
@@ -224,7 +229,7 @@ pub trait Filesystem: Sync {
 
     fn delete(&self, path: String) -> std::io::Result<()>;
 
-    fn temporary_name(&self) -> String;
+    fn temporary_filename(&self) -> std::io::Result<String>;
 }
 
 /// The access an object is opened with.
@@ -706,14 +711,26 @@ mod node {
             // Generate a temporary filename. Not implemented.
             ffi::SQLITE_FCNTL_TEMPFILENAME => {
                 if let Some(p_arg) = (p_arg as *mut *const raw::c_char).as_mut() {
-                    let name = state.filesystem.system.temporary_name();
-                    // unwrap() is fine as os strings are an arbitrary sequences of non-zero bytes
-                    let name = CString::new(name.as_bytes()).unwrap();
-                    let name = ManuallyDrop::new(name);
-                    *p_arg = name.as_ptr();
-                };
+                    match state.filesystem.system.temporary_filename() {
+                        Ok(name) => {
+                            // unwrap() is fine as os strings are an arbitrary sequences of non-zero bytes
+                            let name = CString::new(name.as_bytes()).unwrap();
+                            let name = ManuallyDrop::new(name);
+                            *p_arg = name.as_ptr();
+                        }
+                        Err(e) => {
+                            println!("[vfs::fcntrl] temp-file gen failure {:?}", e);
+                            return state.state.set_last_error(ffi::SQLITE_ERROR, e);
+                        }
+                    };
 
-                ffi::SQLITE_OK
+                    ffi::SQLITE_OK
+                } else {
+                    return state.state.set_last_error(
+                        ffi::SQLITE_IOERR_READ,
+                        std::io::Error::new(std::io::ErrorKind::Other, "Missing a valid path name"),
+                    );
+                }
             }
 
             // Query or set the maximum number of bytes that will be used for memory-mapped I/O.
@@ -809,17 +826,9 @@ mod node {
         }
     }
 
-    pub unsafe extern "C" fn sector_size<F: Filesystem>(
-        p_file: *mut ffi::sqlite3_file,
-    ) -> raw::c_int {
-        let state = get_state!(p_file);
-        println!(
-            "[vfs::file_size] Size of a sector in {:?}",
-            state.database_name
-        );
-
+    pub unsafe extern "C" fn sector_size<F: Filesystem>(_: *mut ffi::sqlite3_file) -> raw::c_int {
         // FIXME: This should be a true bit vector.
-        0
+        F::sector_size() as raw::c_int
     }
     pub unsafe extern "C" fn device_characteristics<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
@@ -977,9 +986,7 @@ mod fs {
 
         println!("[vfs::open] File handle obtained for the resource.",);
 
-        let usable_name = name
-            .clone()
-            .map_or_else(|| state.system.temporary_name(), String::from);
+        let usable_name = name.unwrap_or_default();
 
         println!(
             "[vfs::open] Final path for the resource is {:?}",
