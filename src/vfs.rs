@@ -204,7 +204,7 @@ pub enum FileAccess {
     ReadWrite,
 }
 
-pub trait Filesystem: Sync {
+pub trait Filesystem: Sync + Send {
     type Handle: Resource;
 
     fn full_pathname<'a>(&self, pathname: &'a str) -> std::io::Result<Cow<'a, str>>;
@@ -1317,7 +1317,7 @@ pub fn register<F: Filesystem>(
     vfs_name: &str,
     system: Arc<F>,
     as_default: bool,
-) -> Result<(), Error> {
+) -> Result<(), crate::Error> {
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: RUSQLITE_VFS_VERSION_IO_METHODS,
         xClose: Some(node::close::<F>),
