@@ -16,7 +16,7 @@ use std::{
 
 use crate::Error;
 
-static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 1;
+static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 2;
 static RUSQLITE_VFS_VERSION_IMPL: i32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,15 +129,15 @@ impl Into<std::fs::OpenOptions> for OpenAccess {
         o.read(true).write(self != Self::Read);
         match self {
             Self::Create => {
-                o.create(true);
+                o = o.create(true).clone();
             }
             Self::CreateNew => {
-                o.create_new(true);
+                o = o.create_new(true).clone();
             }
             _ => {}
         };
 
-        return o;
+        o
     }
 }
 
@@ -166,8 +166,8 @@ pub struct File<F: Filesystem> {
 }
 
 impl<F: Filesystem> File<F> {
-    pub fn read_bytes(&mut self, buffer: &mut [u8], offset: usize) -> std::io::Result<()> {
-        self.resource.read_bytes(buffer, offset)
+    pub fn read_bytes(&mut self, mut buffer: &mut [u8], offset: usize) -> std::io::Result<()> {
+        self.resource.read_bytes(&mut buffer, offset)
     }
 
     pub fn write_bytes(&mut self, buffer: &[u8], offset: usize) -> std::io::Result<()> {
@@ -195,6 +195,12 @@ pub trait Resource: Sync {
     fn close(&mut self) -> std::io::Result<()>;
 }
 
+pub enum FileAccess {
+    Readonly,
+    Writable,
+    ReadWrite,
+}
+
 pub trait Filesystem: Sync {
     type Handle: Resource;
 
@@ -205,14 +211,10 @@ pub trait Filesystem: Sync {
     }
 
     /// Check access to `db`. The default implementation always returns `true`.
-    fn exists(&self, _db: &str) -> std::io::Result<bool> {
-        Ok(true)
-    }
+    fn exists(&self, path: &str) -> std::io::Result<bool>;
 
     /// Check access to `db`. The default implementation always returns `true`.
-    fn access(&self, _db: &str, _write: bool) -> std::io::Result<bool> {
-        Ok(true)
-    }
+    fn access(&self, path: &str, level: FileAccess) -> std::io::Result<bool>;
 
     fn random_bytes(&self, buffer: &mut [i8]);
 
@@ -361,12 +363,12 @@ mod node {
         let state = get_state!(p_file);
 
         println!(
-            "[vfs::read] Reading at an offset of {} bytes for {} bytes from {:?}",
+            "[vfs::read] Reading at an offset of {} bytes seeking {} bytes from {:?}",
             i_ofst, i_amt, state.database_name
         );
 
-        let mut read_bytes = Vec::default();
-        if let Err(err) = state.read_bytes(&mut read_bytes, i_ofst as usize) {
+        let out = std::slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
+        if let Err(err) = state.read_bytes(out, i_ofst as usize) {
             println!(
                 "[vfs::read] Read of {} bytes was unsuccessful: {:#?}.",
                 i_amt, err
@@ -380,16 +382,7 @@ mod node {
                 return state.state.set_last_error(ffi::SQLITE_IOERR_READ, err);
             }
         } else {
-            let mut out = std::slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
-
-            if let Err(err) = out.write(&read_bytes) {
-                return state.state.set_last_error(ffi::SQLITE_IOERR_READ, err);
-            }
-            println!(
-                "[vfs::read] Of the wanted {} bytes, {} were read successfully.",
-                i_amt,
-                read_bytes.len()
-            );
+            println!("[vfs::read] Reporting back {} bytes", out.len());
             ffi::SQLITE_OK
         }
     }
@@ -408,10 +401,14 @@ mod node {
         );
 
         let data = std::slice::from_raw_parts(z as *mut u8, i_amt as usize);
+        println!("[vfs::write] Claimed a buffer of {} bytes", data.len());
+
         let result = state.write_bytes(data, i_ofst as usize);
 
+        println!("[vfs::write] Was the write successful? {:?}", result);
+
         match result {
-            Ok(_) => ffi::SQLITE_OK,
+            Ok(()) => ffi::SQLITE_OK,
             Err(err) if err.kind() == ErrorKind::WriteZero => ffi::SQLITE_FULL,
             Err(err) => state.state.set_last_error(ffi::SQLITE_IOERR_WRITE, err),
         }
@@ -750,7 +747,10 @@ mod node {
 
             // Sent to the VFS after a transaction has been committed immediately but before the
             // database is unlocked. Silently ignored.
-            ffi::SQLITE_FCNTL_COMMIT_PHASETWO => ffi::SQLITE_OK,
+            ffi::SQLITE_FCNTL_COMMIT_PHASETWO => {
+                println!("[vfs::fcntrl] Transaction committed; prepping to unlock database.",);
+                ffi::SQLITE_OK
+            }
 
             // Used for debugging. Swap the file handle with the one pointed to by the pArg
             // argument. This capability is used during testing and only needs to be supported when
@@ -819,7 +819,7 @@ mod node {
         );
 
         // FIXME: This should be a true bit vector.
-        1024
+        0
     }
     pub unsafe extern "C" fn device_characteristics<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
@@ -827,7 +827,7 @@ mod node {
         let state = get_state!(p_file);
 
         println!(
-            "[vfs::file_size] Fetching the device characteristics of the system that {:#?} lives on.",
+            "[vfs::device_characteristics] Fetching the device characteristics of the system that {:#?} lives on.",
             state.database_name
         );
 
@@ -929,7 +929,7 @@ mod fs {
     ) -> raw::c_int {
         let state = get_state!(p_vfs);
 
-        println!("[vfs::open] Opening a database.");
+        println!("[vfs::open] Opening a file resource...");
 
         let name = if z_name.is_null() {
             None
@@ -951,7 +951,7 @@ mod fs {
             }
         };
 
-        println!("[vfs::open] Database path is {:?}.", name);
+        println!("[vfs::open] Path is {:?}.", name);
 
         let opts = match OpenOptions::from_flags(flags) {
             Some(opts) => opts,
@@ -963,10 +963,7 @@ mod fs {
             }
         };
 
-        println!(
-            "[vfs::open] Flags for opening the database were {:?}.",
-            opts
-        );
+        println!("[vfs::open] Flags for opening resource were {:?}.", opts);
 
         let out_file = match (p_file as *mut File<F>).as_mut() {
             Some(f) => f,
@@ -978,14 +975,14 @@ mod fs {
             }
         };
 
-        println!("[vfs::open] File handle obtained for the database.",);
+        println!("[vfs::open] File handle obtained for the resource.",);
 
         let usable_name = name
             .clone()
             .map_or_else(|| state.system.temporary_name(), String::from);
 
         println!(
-            "[vfs::open] Final path for the databse is {:?}",
+            "[vfs::open] Final path for the resource is {:?}",
             usable_name
         );
 
@@ -993,7 +990,8 @@ mod fs {
         {
             Ok(resource) => resource,
             Err(err) => {
-                state.set_last_error(ffi::SQLITE_CANTOPEN, dbg!(err));
+                println!("[vfs::open] Failed to open the file {:?}", err);
+                state.set_last_error(ffi::SQLITE_CANTOPEN, err);
                 return ffi::SQLITE_ERROR;
             }
         };
@@ -1003,9 +1001,10 @@ mod fs {
         }
 
         out_file.base.pMethods = &state.io;
-        out_file.database_name = usable_name;
+        out_file.database_name = usable_name.clone();
         out_file.resource = filesystem_resource_handle;
 
+        println!("[vfs::open] Opened the file {:?}", usable_name);
         ffi::SQLITE_OK
     }
 
@@ -1024,6 +1023,11 @@ mod fs {
         match state.system.delete(path.to_string()) {
             Ok(_) => ffi::SQLITE_OK,
             Err(err) => {
+                println!(
+                    "[vfs::delete] Failed to delete the file {:?}: {:?}",
+                    path, err
+                );
+
                 if err.kind() == ErrorKind::NotFound {
                     ffi::SQLITE_IOERR_DELETE_NOENT
                 } else {
@@ -1040,22 +1044,32 @@ mod fs {
         p_res_out: *mut raw::c_int,
     ) -> raw::c_int {
         let state = get_state!(p_vfs);
-        let path = match CStr::from_ptr(z_path).to_str() {
-            Ok(name) => name,
-            Err(_) => {
-                if let Some(p_res_out) = p_res_out.as_mut() {
-                    *p_res_out = false as i32;
-                }
-
-                return ffi::SQLITE_OK;
-            }
-        };
+        let path = from_cstr!(state, z_path, "access failed to construct string");
+        println!(
+            "[vfs::access] Checking for the flag {:?} on the file {:?}",
+            flags, path
+        );
 
         let result = match flags {
-            ffi::SQLITE_ACCESS_EXISTS => state.system.exists(path),
-            ffi::SQLITE_ACCESS_READ => state.system.access(path, false),
-            ffi::SQLITE_ACCESS_READWRITE => state.system.access(path, true),
-            _ => return ffi::SQLITE_IOERR_ACCESS,
+            ffi::SQLITE_ACCESS_EXISTS => {
+                println!("[vfs::access] Checking if {:?} exists on disk.", path);
+                state.system.exists(path)
+            }
+            ffi::SQLITE_ACCESS_READ => {
+                println!("[vfs::access] Checking if {:?} is readable on disk.", path);
+                state.system.access(path, FileAccess::Readonly)
+            }
+            ffi::SQLITE_ACCESS_READWRITE => {
+                println!(
+                    "[vfs::access] Checking if {:?} is readable and writable on disk.",
+                    path
+                );
+                state.system.access(path, FileAccess::ReadWrite)
+            }
+            _ => {
+                println!("[vfs::access] Unrecognized flag {:?}", flags);
+                return ffi::SQLITE_IOERR_ACCESS;
+            }
         };
 
         if let Err(err) = result.and_then(|ok| {
@@ -1063,8 +1077,18 @@ mod fs {
                 .as_mut()
                 .ok_or_else(|| std::io::Error::new(ErrorKind::Other, "received null pointer"))?;
             *p_res_out = ok as i32;
+            println!(
+                "[vfs::access] The flag {:?} for {:?} exists? [{}]",
+                flags,
+                path,
+                ok.to_string()
+            );
             Ok(())
         }) {
+            println!(
+                "[vfs::access] Failed to obtain access to {:?} with {:?}: {:?}",
+                path, flags, err
+            );
             state.set_last_error(ffi::SQLITE_IOERR_ACCESS, err)
         } else {
             ffi::SQLITE_OK
@@ -1081,21 +1105,14 @@ mod fs {
 
         println!("[vfs::full_pathname] Attempting to discern the whole path name for the provided text. ");
 
-        let path = match CStr::from_ptr(z_path).to_str() {
-            Ok(name) => name,
-            Err(_) => {
-                return state.set_last_error(
-                    ffi::SQLITE_ERROR,
-                    std::io::Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "full_pathname failed: database must be valid utf8 (received: {:?})",
-                            CStr::from_ptr(z_path)
-                        ),
-                    ),
-                )
-            }
-        };
+        let path = from_cstr!(
+            state,
+            z_path,
+            format!(
+                "full_pathname failed: database name must be valid UTF-8 (received {:?})",
+                CStr::from_ptr(z_path)
+            )
+        );
 
         println!("[vfs::full_pathname] Provided path is {:?}", path);
 
@@ -1105,13 +1122,20 @@ mod fs {
             })
         }) {
             Ok(name) => name,
-            Err(err) => return state.set_last_error(ffi::SQLITE_ERROR, dbg!(err)),
+            Err(err) => {
+                println!(
+                    "[vfs::full_pathname] Failed to get the true path of {:?}: {:?}",
+                    path, err
+                );
+                return state.set_last_error(ffi::SQLITE_ERROR, err);
+            }
         };
 
         println!("[vfs::full_pathname] Resolved path is {:?}", name);
 
         let name = name.to_bytes_with_nul();
         if name.len() > n_out as usize || name.len() > F::maximum_file_pathname_size() {
+            println!("[vfs::full_pathname] Resolved path is too long.");
             return state.set_last_error(
                 ffi::SQLITE_CANTOPEN,
                 std::io::Error::new(ErrorKind::Other, "full pathname is too long"),
@@ -1236,56 +1260,6 @@ mod fs {
         *p = now;
         ffi::SQLITE_OK
     }
-
-    // FIXME: This is part of v2 of the vfs object.
-    //     pub unsafe extern "C" fn set_system_call<F: Filesystem>(
-    //         p_vfs: *mut ffi::sqlite3_vfs,
-    //         z_name: *const ::std::os::raw::c_char,
-    //         p_new_func: ffi::sqlite3_syscall_ptr,
-    //     ) -> ::std::os::raw::c_int {
-    //         let state = match underlying_state::<F>(p_vfs) {
-    //             Some(state) => state,
-    //             None => return ffi::SQLITE_ERROR,
-    //         };
-
-    //         if let Some(set_system_call) = state.parent.as_ref().and_then(|v| v.xSetSystemCall) {
-    //             return set_system_call(state.parent, z_name, p_new_func);
-    //         }
-
-    //         ffi::SQLITE_ERROR
-    //     }
-
-    //     pub unsafe extern "C" fn get_system_call<F: Filesystem>(
-    //         p_vfs: *mut ffi::sqlite3_vfs,
-    //         z_name: *const ::std::os::raw::c_char,
-    //     ) -> ffi::sqlite3_syscall_ptr {
-    //         let state = match underlying_state::<F>(p_vfs) {
-    //             Some(state) => state,
-    //             None => return None,
-    //         };
-
-    //         if let Some(get_system_call) = state.parent.as_ref().and_then(|v| v.xGetSystemCall) {
-    //             return get_system_call(state.parent, z_name);
-    //         }
-
-    //         None
-    //     }
-
-    //     pub unsafe extern "C" fn next_system_call<F: Filesystem>(
-    //         p_vfs: *mut ffi::sqlite3_vfs,
-    //         z_name: *const ::std::os::raw::c_char,
-    //     ) -> *const ::std::os::raw::c_char {
-    //         if let Some(state) = underlying_state::<F>(p_vfs) {
-    //             state
-    //                 .parent
-    //                 .as_ref()
-    //                 .and_then(|v| v.xNextSystemCall)
-    //                 .map(|c| c(state.parent, z_name))
-    //                 .unwrap_or(ptr::null())
-    //         } else {
-    //             ptr::null()
-    //         }
-    //     }
 
     pub unsafe extern "C" fn get_last_error<F: Filesystem>(
         p_vfs: *mut ffi::sqlite3_vfs,

@@ -105,6 +105,7 @@ modern-full = [
     "url",
     "uuid",
     "vtab",
+    "vfs",
     "window",
 ]
 

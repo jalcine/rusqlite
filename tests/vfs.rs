@@ -10,7 +10,8 @@ mod vfs_test {
 
     use std::{
         borrow::Cow,
-        io::{Read, Write},
+        fs::File,
+        io::{BufReader, Read, Seek, Write},
         os::linux::fs::MetadataExt,
         path::{Path, PathBuf},
         time::Duration,
@@ -18,29 +19,74 @@ mod vfs_test {
 
     struct OsFs {}
     struct OsHandle {
-        file: std::fs::File,
+        flags: std::fs::OpenOptions,
+        path: String,
         lock: LockState,
+        delete_on_close: bool,
+    }
+
+    impl OsHandle {
+        fn file(&self) -> std::io::Result<File> {
+            self.flags.open(&self.path)
+        }
     }
 
     impl Resource for OsHandle {
-        fn read_bytes(&mut self, buffer: &mut [u8], offset: usize) -> std::io::Result<()> {
-            use std::io::{Seek, SeekFrom};
-            self.file.seek(SeekFrom::Start(offset as u64))?;
-            self.file.read(buffer).and(Ok(()))
+        fn read_bytes(&mut self, mut buffer: &mut [u8], offset: usize) -> std::io::Result<()> {
+            println!("[[test]] reading bytes.");
+            let file = self.file()?;
+            let mut reader = BufReader::new(file.try_clone()?);
+
+            println!(
+                "[[test]] at position on open: {:?}",
+                reader.stream_position()
+            );
+
+            reader.seek_relative(offset as i64)?;
+            println!(
+                "[[test]] at position after seek: {:?}",
+                reader.stream_position()
+            );
+
+            file.sync_all()?;
+            println!(
+                "[[test]] at position after sync: {:?}",
+                reader.stream_position()
+            );
+
+            reader.read_exact(&mut buffer)?;
+
+            println!(
+                "[[test]] at position after 'read': {:?}",
+                reader.stream_position()
+            );
+            println!("[[test]] got {} bytes as {:?}", buffer.len(), buffer);
+
+            file.sync_all()
         }
 
         fn write_bytes(&mut self, buffer: &[u8], offset: usize) -> std::io::Result<()> {
-            use std::io::{Seek, SeekFrom};
-            self.file.seek(SeekFrom::Start(offset as u64))?;
-            self.file.write_all(buffer)
+            println!("[[test]] writing bytes.");
+            let mut file = self.file()?;
+            let new_pos = file.seek(std::io::SeekFrom::Start(offset as u64))?;
+            file.write_all(buffer)
         }
 
         fn file_size(&self) -> std::io::Result<usize> {
-            self.file.metadata().map(|m| m.st_size() as usize)
+            println!("[[test]] file size.");
+            let file = self.file()?;
+            file.metadata().map(|m| m.st_size() as usize)
         }
 
         fn has_moved(&self) -> std::io::Result<bool> {
-            Ok(false)
+            println!("[[test]] has moved.");
+            std::fs::metadata(&self.path).map(|_| false).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(true)
+                } else {
+                    Err(e)
+                }
+            })
         }
 
         fn lock_state(&self) -> std::io::Result<LockState> {
@@ -53,7 +99,8 @@ mod vfs_test {
         }
 
         fn close(&mut self) -> std::io::Result<()> {
-            self.file.sync_all()
+            println!("[[test]] closed.");
+            Ok(())
         }
     }
 
@@ -67,18 +114,21 @@ mod vfs_test {
             duration
         }
 
-        fn open(&self, path: String, flags: OpenOptions) -> Result<Self::Handle, std::io::Error> {
-            let flags: std::fs::OpenOptions = flags.access.into();
-            let file = flags.open(path)?;
-
+        fn open(
+            &self,
+            path: String,
+            sql_flags: OpenOptions,
+        ) -> Result<Self::Handle, std::io::Error> {
             Ok(Self::Handle {
-                file,
+                flags: sql_flags.access.into(),
+                path,
                 lock: LockState::default(),
+                delete_on_close: sql_flags.delete_on_close,
             })
         }
 
         fn temporary_name(&self) -> String {
-            todo!()
+            "foobar".to_string()
         }
 
         fn full_pathname<'a>(&self, pathname: &'a str) -> Result<Cow<'a, str>, std::io::Error> {
@@ -91,6 +141,27 @@ mod vfs_test {
 
         fn delete(&self, path: String) -> std::io::Result<()> {
             std::fs::remove_file(path)
+        }
+
+        fn exists(&self, path: &str) -> std::io::Result<bool> {
+            std::fs::metadata(path).map(|_| true).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            })
+        }
+
+        fn access(&self, path: &str, level: rusqlite::vfs::FileAccess) -> std::io::Result<bool> {
+            match level {
+                rusqlite::vfs::FileAccess::Readonly => {
+                    std::fs::metadata(path).map(|m| m.permissions().readonly())
+                }
+                rusqlite::vfs::FileAccess::Writable | rusqlite::vfs::FileAccess::ReadWrite => {
+                    std::fs::metadata(path).map(|m| !m.permissions().readonly())
+                }
+            }
         }
     }
 
@@ -142,7 +213,7 @@ mod vfs_test {
         );
 
         let conn_result = rusqlite::Connection::open_with_flags_and_vfs(
-            "file:./test.sqlite",
+            "file:test.sqlite",
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             "test-vfs",
         );
@@ -177,7 +248,7 @@ mod vfs_test {
             )
             .err(),
             None,
-            "no errors when inserting records"
+            "inserting records"
         );
 
         let stmt_result = conn.prepare("SELECT id, name, data FROM person");
