@@ -32,6 +32,7 @@ mod vfs_test {
         }
     }
 
+    #[derive(Clone)]
     struct OsHandle {
         flags: std::fs::OpenOptions,
         path: String,

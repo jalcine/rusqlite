@@ -1,13 +1,12 @@
 // TODO: Implement the root VFS trait
 // TODO: Implement a trait representing a file/resource handle.
 
-// A lot of the work here is being cribbed from https://github.com/rkusa/sqlite-vfs/blob/main/src/lib.rs
+// A lot o&f the work here is being cribbed from https://github.com/rkusa/sqlite-vfs/blob/main/src/lib.rs
 
 use libsqlite3_sys as ffi;
 use std::{
     borrow::Cow,
     ffi::CString,
-    io::Write,
     os::raw,
     ptr,
     sync::{Arc, Mutex},
@@ -19,6 +18,29 @@ use crate::Error;
 static RUSQLITE_VFS_VERSION_IO_METHODS: i32 = 3;
 static RUSQLITE_VFS_VERSION_IMPL: i32 = 3;
 
+macro_rules! from_cstr {
+    ($state: expr, $cstr: expr, $msg: expr) => {
+        match CStr::from_ptr($cstr).to_str() {
+            Ok(cstr_value) => cstr_value,
+            Err(err) => {
+                return $state.set_last_error(
+                    ffi::SQLITE_ERROR,
+                    std::io::Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "{} (received: {:?}) because of {:#?}",
+                            $msg,
+                            CStr::from_ptr($cstr),
+                            err
+                        ),
+                    ),
+                )
+            }
+        }
+    };
+}
+
+/// Options for opening a file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenOptions {
     /// The object type that is being opened.
@@ -27,6 +49,7 @@ pub struct OpenOptions {
     /// The access an object is opened with.
     pub access: OpenAccess,
 
+    /// Determines if this file will be deleted on close.
     pub delete_on_close: bool,
 }
 
@@ -84,6 +107,11 @@ impl OpenAccess {
                 ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_EXCLUSIVE
             }
         }
+    }
+
+    /// Determines if there's a hint to create this file first.
+    pub fn should_create(&self) -> bool {
+        matches!(self, Self::Create) || matches!(self, Self::CreateNew)
     }
 }
 
@@ -144,91 +172,179 @@ impl Into<std::fs::OpenOptions> for OpenAccess {
 /// The object type that is being opened.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpenKind {
+    /// Main database
     MainDb,
+    /// Main journal.
     MainJournal,
+    /// Temp database
     TempDb,
+    /// Temp journal.
     TempJournal,
+    /// Transient db.
     TransientDb,
+    /// Sub journal.
     SubJournal,
+    /// Super journal.
     SuperJournal,
+    /// Write-ahead log.
     Wal,
 }
 
+/// A file on the filesystem.
 #[repr(C)]
 pub struct File<F: Filesystem> {
     base: ffi::sqlite3_file,
     filesystem: Arc<State<F>>,
-    resource: F::Handle,
+    resource: Option<Box<F::Handle>>,
     database_name: String,
     state: State<F>,
     wal_persistence: bool,
     powersafe_overwrite: bool,
 }
 
+fn no_file_err(path: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "No file has been associated to this resource claiming {:?}",
+            path
+        ),
+    )
+}
+
 impl<F: Filesystem> File<F> {
+    /// Reads some bytes into a buffer.
     pub fn read_bytes(&mut self, mut buffer: &mut [u8], offset: usize) -> std::io::Result<()> {
-        self.resource.read_bytes(&mut buffer, offset)
+        if let Some(r) = self.resource.as_mut() {
+            r.read_bytes(&mut buffer, offset)
+        } else {
+            Err(no_file_err(&self.database_name))
+        }
     }
 
+    /// Writes n bytes into a buffer.
     pub fn write_bytes(&mut self, buffer: &[u8], offset: usize) -> std::io::Result<()> {
-        self.resource.write_bytes(buffer, offset)
+        if let Some(r) = self.resource.as_mut() {
+            r.write_bytes(buffer, offset)
+        } else {
+            Err(no_file_err(&self.database_name))
+        }
     }
 
+    /// Obtains the size of the file.
     pub fn file_size(&self) -> std::io::Result<usize> {
-        self.resource.file_size()
+        if let Some(r) = &self.resource {
+            r.file_size()
+        } else {
+            Err(no_file_err(&self.database_name))
+        }
     }
+
+    /// Gets the sector size of a file.
     pub fn sector_size(&self) -> usize {
         F::sector_size()
     }
 }
 
-pub trait Resource: Sync {
+/// Represents a file handle on a filesystem.
+pub trait Resource: Sync + Clone {
+    /// Read bytes.
     fn read_bytes(&mut self, buffer: &mut [u8], offset: usize) -> std::io::Result<()>;
 
+    /// Write bytes.
     fn write_bytes(&mut self, buffer: &[u8], offset: usize) -> std::io::Result<()>;
 
+    /// File size.
     fn file_size(&self) -> std::io::Result<usize>;
 
+    /// Has moved?
     fn has_moved(&self) -> std::io::Result<bool>;
 
+    /// The lock state.
     fn lock_state(&self) -> std::io::Result<LockState>;
 
+    /// Set the lock state.
     fn set_lock_state(&mut self, new_lock_state: LockState) -> std::io::Result<()>;
 
-    fn close(&mut self) -> std::io::Result<()>;
+    /// Close out the file.
+    fn close(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Synchronize file information to the system.
+    ///
+    /// This can be safely ignored by implementations that don't need it.
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Adjust the hint representing the size of the file.
+    ///
+    /// This can be safely ignored by implementations that don't need it.
+    /// This _should_ be considered a value that can be multipled against
+    /// one's chunk size.
+    fn apply_size_hint(&mut self, _size_hint: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Returns the size of chunks the databae is stored in.
+    fn chunk_size(&self) -> std::io::Result<usize> {
+        Ok(1024)
+    }
+
+    /// Adjust the chunk size.
+    fn apply_chunk_size(&mut self, _chunk_size: usize) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
+/// The kind of access to check for.
 pub enum FileAccess {
+    /// Only can read?
     Readonly,
+    /// Only can write?
     Writable,
+    /// Can read and write
     ReadWrite,
 }
 
+/// The filesystem.
 pub trait Filesystem: Sync + Send {
+    /// A representation of a file handle on this system.
     type Handle: Resource;
 
+    /// Obtains the full path of a provided string.
     fn full_pathname<'a>(&self, pathname: &'a str) -> std::io::Result<Cow<'a, str>>;
 
+    /// Obtains the maximum length of a path.
     fn maximum_file_pathname_size() -> usize {
         1024
     }
 
-    fn sector_size() -> usize;
+    /// The size of a sector
+    fn sector_size() -> usize {
+        1
+    }
 
-    /// Check access to `db`. The default implementation always returns `true`.
+    /// Check access to `db`.
     fn exists(&self, path: &str) -> std::io::Result<bool>;
 
-    /// Check access to `db`. The default implementation always returns `true`.
+    /// Check access to `db`.
     fn access(&self, path: &str, level: FileAccess) -> std::io::Result<bool>;
 
+    /// Generates random bytes.
     fn random_bytes(&self, buffer: &mut [i8]);
 
+    /// Sleeps for the time specified.
     fn sleep(&self, duration: Duration) -> Duration;
 
+    /// Opens a file.
     fn open(&self, path: String, flags: OpenOptions) -> std::io::Result<Self::Handle>;
 
+    /// Deletes the file.
     fn delete(&self, path: String) -> std::io::Result<()>;
 
+    /// Generates a temporary filename.
     fn temporary_filename(&self) -> std::io::Result<String>;
 }
 
@@ -309,6 +425,7 @@ impl Default for LockState {
 }
 
 impl LockState {
+    /// Determines if this is locked.
     pub fn is_locked(&self) -> bool {
         *self != Self::None
     }
@@ -333,7 +450,7 @@ fn null_ptr_error() -> std::io::Error {
 }
 
 mod node {
-    use std::{ffi::CStr, io::ErrorKind, mem::ManuallyDrop};
+    use std::{borrow::Borrow, ffi::CStr, io::ErrorKind, mem::ManuallyDrop};
 
     use super::*;
 
@@ -346,12 +463,22 @@ mod node {
         };
     }
 
+    macro_rules! get_resource_from_state {
+        ($f: expr, $err_code: expr, $path: expr) => {
+            match $f.resource.as_mut() {
+                Some(r) => r,
+                None => return $f.state.set_last_error($err_code, no_file_err($path)),
+            }
+        };
+    }
+
     pub unsafe extern "C" fn close<F: Filesystem>(p_file: *mut ffi::sqlite3_file) -> raw::c_int {
         let state = get_state!(p_file);
 
         println!("[vfs::close] Closing {:?}", state.database_name);
+        let r = get_resource_from_state!(state, ffi::SQLITE_IOERR_CLOSE, &state.database_name);
 
-        if let Err(e) = state.resource.close() {
+        if let Err(e) = r.close() {
             state.state.set_last_error(ffi::SQLITE_IOERR_CLOSE, e)
         } else {
             drop(state);
@@ -434,7 +561,7 @@ mod node {
 
     pub unsafe extern "C" fn sync<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
-        flags: raw::c_int,
+        _flags: raw::c_int,
     ) -> raw::c_int {
         let state = get_state!(p_file);
         println!(
@@ -485,7 +612,8 @@ mod node {
     }
 
     fn set_lock<F: Filesystem>(state: &mut File<F>, lock_state: LockState) -> raw::c_int {
-        if let Err(e) = state.resource.set_lock_state(lock_state) {
+        let r = get_resource_from_state!(state, ffi::SQLITE_ERROR, &state.database_name);
+        if let Err(e) = r.set_lock_state(lock_state) {
             state.state.set_last_error(ffi::SQLITE_IOERR_FSTAT, e)
         } else {
             ffi::SQLITE_OK
@@ -505,6 +633,7 @@ mod node {
 
         set_lock(state, lock_kind)
     }
+
     pub unsafe extern "C" fn check_reserved_lock<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut raw::c_int,
@@ -512,16 +641,22 @@ mod node {
         let state = get_state!(p_file);
         println!("[vfs::check_reserved_lock] Checking the status of the current lock.");
 
-        if let Err(err) = state.resource.lock_state().and_then(|lock| {
-            let p_res_out: &mut raw::c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
-            println!("[vfs::check_reserved_lock] We have a {:?} lock", lock);
-            *p_res_out = lock.is_locked() as raw::c_int;
-            Ok(())
-        }) {
-            return state.state.set_last_error(ffi::SQLITE_IOERR_UNLOCK, err);
-        }
+        if let Some(r) = &state.resource {
+            if let Err(err) = r.lock_state().and_then(|lock| {
+                let p_res_out: &mut raw::c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
+                println!("[vfs::check_reserved_lock] We have a {:?} lock", lock);
+                *p_res_out = lock.is_locked() as raw::c_int;
+                Ok(())
+            }) {
+                return state.state.set_last_error(ffi::SQLITE_IOERR_UNLOCK, err);
+            }
 
-        ffi::SQLITE_OK
+            ffi::SQLITE_OK
+        } else {
+            state
+                .state
+                .set_last_error(ffi::SQLITE_IOERR_FSTAT, no_file_err(&state.database_name))
+        }
     }
 
     pub unsafe extern "C" fn file_control<F: Filesystem>(
@@ -572,63 +707,55 @@ mod node {
             // Write last error number into (int)pArg.
             ffi::SQLITE_FCNTL_LAST_ERRNO => {
                 // FIXME: Store error numbers like this on the file.
-                // if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
-                //     *p_arg = state.last_errno;
-                // }
-                ffi::SQLITE_NOTFOUND
+                if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                    if let Ok(code) = state
+                        .state
+                        .error
+                        .lock()
+                        .map(|g| g.as_ref().map(|(code, _)| code.clone()).unwrap_or_default())
+                    {
+                        *p_arg = code;
+                    }
+                }
+                ffi::SQLITE_OK
             }
 
             // Give the VFS layer a hint of how large the database file will grow to be during the
             // current transaction.
             ffi::SQLITE_FCNTL_SIZE_HINT => {
-                // FIXME: Come back to this.
-                /*
+                let r = get_resource_from_state!(state, ffi::SQLITE_ERROR, &state.database_name);
                 let size_hint = match (p_arg as *mut i64).as_ref().cloned().map(|s| s.abs()) {
-                    Some(chunk_size) => chunk_size,
+                    Some(hint) => hint,
                     None => {
-                        return state.set_last_error(
+                        return state.state.set_last_error(
                             ffi::SQLITE_NOTFOUND,
                             std::io::Error::new(ErrorKind::Other, "expect size hint arg"),
                         );
                     }
                 };
 
-                // #[cfg(feature = "sqlite_test")]
-                // let _benign = simulate_io_error_benign();
+                println!(
+                    "[vfs::fcntrl] Adjusting the size hint to be {:?}",
+                    size_hint
+                );
 
-                let current = match state.file.size() {
-                    Ok(size) => size,
-                    Err(err) => return state.set_last_error(ffi::SQLITE_ERROR, err),
-                };
-
-                if current > size_hint {
-                    return ffi::SQLITE_OK;
+                if let Err(e) = r.apply_size_hint(size_hint as usize) {
+                    println!(
+                        "[vfs::fcntrl] Failed to set the size hint for {:?} to be {}: {:#?}",
+                        state.database_name, size_hint, e
+                    );
+                    return state.state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, e);
                 }
 
-                if let Some(chunk_size) = state.chunk_size {
-                    let chunk_size = chunk_size as u64;
-                    let size = ((size_hint + chunk_size - 1) / chunk_size) * chunk_size;
-                    if let Err(err) = state.file.set_len(size) {
-                        return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
-                    }
-                } else if let Err(err) = state.file.set_len(size_hint) {
-                    return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
-                }
-
-                // #[cfg(feature = "sqlite_test")]
-                // if simulate_io_error() {
-                //     return ffi::SQLITE_IOERR_TRUNCATE;
-                // }
-                */
-                ffi::SQLITE_NOTFOUND
+                ffi::SQLITE_OK
             }
 
             // Request that the VFS extends and truncates the database file in chunks of a size
             // specified by the user. Return an error as this is not forwarded to the [Vfs] trait
             // right now.
             ffi::SQLITE_FCNTL_CHUNK_SIZE => {
-                // FIXME: Come back to this.
-                /*
+                use std::convert::TryFrom;
+
                 let chunk_size = match (p_arg as *mut i32)
                     .as_ref()
                     .cloned()
@@ -636,21 +763,25 @@ mod node {
                 {
                     Some(chunk_size) => chunk_size,
                     None => {
-                        return state.set_last_error(
+                        return state.state.set_last_error(
                             ffi::SQLITE_NOTFOUND,
                             std::io::Error::new(ErrorKind::Other, "expect chunk_size arg"),
                         );
                     }
                 };
 
-                if let Err(err) = state.file.set_chunk_size(chunk_size) {
-                    return state.set_last_error(ffi::SQLITE_ERROR, err);
-                }
+                let r = get_resource_from_state!(state, ffi::SQLITE_ERROR, &state.database_name);
 
-                state.chunk_size = Some(chunk_size);
-                */
+                println!(
+                    "[vfs::fcntrl] Adjusting the chunk size to be {:?}",
+                    chunk_size
+                );
 
-                ffi::SQLITE_NOTFOUND
+                if let Err(err) = r.apply_chunk_size(chunk_size) {
+                    return state.state.set_last_error(ffi::SQLITE_ERROR, err);
+                };
+
+                ffi::SQLITE_OK
             }
 
             // Configure automatic retry counts and intervals for certain disk I/O operations for
@@ -674,7 +805,10 @@ mod node {
 
             // Indicate that, unless it is rolled back for some reason, the entire database file
             // will be overwritten by the current transaction. Not implemented.
-            ffi::SQLITE_FCNTL_OVERWRITE => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_OVERWRITE => {
+                println!("[vfs::fcntrl] Pending truncation of whole file.");
+                ffi::SQLITE_OK
+            }
 
             // Used to obtain the names of all VFSes in the VFS stack.
             ffi::SQLITE_FCNTL_VFSNAME => {
@@ -701,12 +835,23 @@ mod node {
             }
 
             // Optionally intercept PRAGMA statements. Always fall back to normal pragma processing.
-            ffi::SQLITE_FCNTL_PRAGMA => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_PRAGMA => {
+                let pragma_name = "";
+                let pragma_args = [""; 1];
+                println!(
+                    "[vfs::fcntrl] Pragma {:?} was invoked with the arguments {:?}",
+                    pragma_name, pragma_args
+                );
+                ffi::SQLITE_NOTFOUND // Allow SQLite to take over.
+            }
 
             // May be invoked by SQLite on the database file handle shortly after it is opened in
             // order to provide a custom VFS with access to the connection's busy-handler callback.
             // Not implemented.
-            ffi::SQLITE_FCNTL_BUSYHANDLER => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_BUSYHANDLER => {
+                println!("[vfs::fcntrl] Handling wait handler for the VFS.");
+                ffi::SQLITE_NOTFOUND
+            }
 
             // Generate a temporary filename. Not implemented.
             ffi::SQLITE_FCNTL_TEMPFILENAME => {
@@ -735,7 +880,10 @@ mod node {
 
             // Query or set the maximum number of bytes that will be used for memory-mapped I/O.
             // Not implemented.
-            ffi::SQLITE_FCNTL_MMAP_SIZE => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_MMAP_SIZE => {
+                println!("[vfs::fcntrl] Adjusting (or querying) the size of memory-mapped I/O");
+                ffi::SQLITE_NOTFOUND
+            }
 
             // Advisory information to the VFS about what the higher layers of the SQLite stack are
             // doing.
@@ -748,19 +896,41 @@ mod node {
 
             // Check whether or not the file has been renamed, moved, or deleted since it was first
             // opened.
-            ffi::SQLITE_FCNTL_HAS_MOVED => match state.resource.has_moved() {
-                Ok(moved) => {
-                    if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
-                        *p_arg = moved as i32;
+            ffi::SQLITE_FCNTL_HAS_MOVED => {
+                let r = get_resource_from_state!(state, ffi::SQLITE_ERROR, &state.database_name);
+                match r.has_moved() {
+                    Ok(moved) => {
+                        if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                            *p_arg = moved as i32;
+                        }
+                        ffi::SQLITE_OK
                     }
-                    ffi::SQLITE_OK
+                    Err(err) => state.state.set_last_error(ffi::SQLITE_ERROR, err),
                 }
-                Err(err) => state.state.set_last_error(ffi::SQLITE_ERROR, err),
-            },
+            }
 
             // Sent to the VFS immediately before the xSync method is invoked on a database file
             // descriptor. Silently ignored.
-            ffi::SQLITE_FCNTL_SYNC => ffi::SQLITE_OK,
+            ffi::SQLITE_FCNTL_SYNC => {
+                let r = get_resource_from_state!(state, ffi::SQLITE_ERROR, &state.database_name);
+                println!(
+                    "[vfs::fcntrl] Requesting sync {:?} to disk.",
+                    state.database_name
+                );
+                if let Err(err) = r.sync() {
+                    println!(
+                        "[vfs::fcntrl] Failed to sync {:?} to disk: {:#?}.",
+                        state.database_name, err
+                    );
+                    state.state.set_last_error(ffi::SQLITE_ERROR, err)
+                } else {
+                    println!(
+                        "[vfs::fcntrl] {:?} was synced to disk.",
+                        state.database_name
+                    );
+                    ffi::SQLITE_OK
+                }
+            }
 
             // Sent to the VFS after a transaction has been committed immediately but before the
             // database is unlocked. Silently ignored.
@@ -778,7 +948,10 @@ mod node {
             // if the lock is not immediately available. The WAL subsystem issues this signal during
             // rare circumstances in order to fix a problem with priority inversion.
             // Not implemented.
-            ffi::SQLITE_FCNTL_WAL_BLOCK => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_WAL_BLOCK => {
+                println!("[vfs::fcntrl] Hinting at a need to block the WAL");
+                ffi::SQLITE_NOTFOUND
+            }
 
             // Implemented by zipvfs only.
             ffi::SQLITE_FCNTL_ZIPVFS => ffi::SQLITE_NOTFOUND,
@@ -796,33 +969,54 @@ mod node {
             // Used for "batch write mode". Not supported.
             ffi::SQLITE_FCNTL_BEGIN_ATOMIC_WRITE
             | ffi::SQLITE_FCNTL_COMMIT_ATOMIC_WRITE
-            | ffi::SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE => ffi::SQLITE_NOTFOUND,
+            | ffi::SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE => {
+                println!("[vfs::fcntrl] Handling an atomic write operation.");
+                ffi::SQLITE_NOTFOUND
+            }
 
             // Configure a VFS to block for up to M milliseconds before failing when attempting to
             // obtain a file lock using the xLock or xShmLock methods of the VFS. Not implemented.
-            ffi::SQLITE_FCNTL_LOCK_TIMEOUT => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_LOCK_TIMEOUT => {
+                println!("[vfs::fcntrl] Implementing lock wait timeout.");
+                ffi::SQLITE_NOTFOUND
+            }
 
             // Used by in-memory VFS.
-            ffi::SQLITE_FCNTL_SIZE_LIMIT => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_SIZE_LIMIT => {
+                println!("[vfs::fcntrl] in-mem vfs: size limit");
+                ffi::SQLITE_NOTFOUND
+            }
 
             // Invoked from within a checkpoint in wal mode after the client has finished copying
             // pages from the wal file to the database file, but before the *-shm file is updated to
             // record the fact that the pages have been checkpointed. Silently ignored.
-            ffi::SQLITE_FCNTL_CKPT_DONE => ffi::SQLITE_OK,
+            ffi::SQLITE_FCNTL_CKPT_DONE => {
+                println!("[vfs::fcntrl] in-mem vfs: size limit");
+                ffi::SQLITE_OK
+            }
 
             // Invoked from within a checkpoint in wal mode before the client starts to copy pages
             // from the wal file to the database file. Silently ignored.
-            ffi::SQLITE_FCNTL_CKPT_START => ffi::SQLITE_OK,
+            ffi::SQLITE_FCNTL_CKPT_START => {
+                println!("[vfs::fcntrl] in-mem vfs: size limit");
+                ffi::SQLITE_OK
+            }
 
             // Detect whether or not there is a database client in another process with a wal-mode
             // transaction open on the database or not. Not implemented because it is a
             // unix-specific feature.
-            ffi::SQLITE_FCNTL_EXTERNAL_READER => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_EXTERNAL_READER => {
+                println!("[vfs::fcntrl] in-mem vfs: size limit");
+                ffi::SQLITE_NOTFOUND
+            }
 
             // Unknown use-case. Ignored.
             ffi::SQLITE_FCNTL_CKSM_FILE => ffi::SQLITE_NOTFOUND,
 
-            _ => ffi::SQLITE_NOTFOUND,
+            _ => {
+                println!("[vfs::fcntrl] Unhandled code: {:?}", op);
+                ffi::SQLITE_NOTFOUND
+            }
         }
     }
 
@@ -851,23 +1045,23 @@ mod node {
     }
     pub unsafe extern "C" fn shm_map<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
-        region_ix: raw::c_int,
-        region_size: raw::c_int,
-        b_extend: raw::c_int,
-        pp: *mut *mut raw::c_void,
+        _region_ix: raw::c_int,
+        _region_size: raw::c_int,
+        _b_extend: raw::c_int,
+        _pp: *mut *mut raw::c_void,
     ) -> raw::c_int {
-        let state = get_state!(p_file);
+        let _state = get_state!(p_file);
         println!("shm:map");
         ffi::SQLITE_OK
     }
 
     pub unsafe extern "C" fn shm_lock<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
-        offset: raw::c_int,
-        n: raw::c_int,
-        flags: raw::c_int,
+        _offset: raw::c_int,
+        _n: raw::c_int,
+        _flags: raw::c_int,
     ) -> raw::c_int {
-        let state = get_state!(p_file);
+        let _state = get_state!(p_file);
         println!("shm:lock");
         ffi::SQLITE_OK
     }
@@ -879,34 +1073,12 @@ mod node {
 
     pub unsafe extern "C" fn shm_unmap<F: Filesystem>(
         p_file: *mut ffi::sqlite3_file,
-        delete_flags: raw::c_int,
+        _delete_flags: raw::c_int,
     ) -> raw::c_int {
-        let state = get_state!(p_file);
+        let _state = get_state!(p_file);
         println!("shm:unmap");
         ffi::SQLITE_OK
     }
-}
-
-macro_rules! from_cstr {
-    ($state: expr, $cstr: expr, $msg: expr) => {
-        match CStr::from_ptr($cstr).to_str() {
-            Ok(cstr_value) => cstr_value,
-            Err(err) => {
-                return $state.set_last_error(
-                    ffi::SQLITE_ERROR,
-                    std::io::Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "{} (received: {:?}) because of {:#?}",
-                            $msg,
-                            CStr::from_ptr($cstr),
-                            err
-                        ),
-                    ),
-                )
-            }
-        }
-    };
 }
 
 mod fs {
@@ -1009,7 +1181,7 @@ mod fs {
 
         out_file.base.pMethods = &state.io;
         out_file.database_name = usable_name.clone();
-        out_file.resource = filesystem_resource_handle;
+        out_file.resource = Some(Box::new(filesystem_resource_handle));
 
         println!("[vfs::open] Opened the file {:?}", usable_name);
         ffi::SQLITE_OK
@@ -1332,10 +1504,10 @@ pub fn register<F: Filesystem>(
         xFileControl: Some(node::file_control::<F>),
         xSectorSize: Some(node::sector_size::<F>),
         xDeviceCharacteristics: Some(node::device_characteristics::<F>),
-        xShmMap: None,
-        xShmLock: None,
-        xShmBarrier: None,
-        xShmUnmap: None,
+        xShmMap: Some(node::shm_map::<F>),
+        xShmLock: Some(node::shm_lock::<F>),
+        xShmBarrier: Some(node::shm_barrier::<F>),
+        xShmUnmap: Some(node::shm_unmap::<F>),
         xFetch: None,
         xUnfetch: None,
     };
