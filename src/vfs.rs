@@ -1,8 +1,7 @@
 // TODO: Implement the root VFS trait
 // TODO: Implement a trait representing a file/resource handle.
 
-// A lot o&f the work here is being cribbed from https://github.com/rkusa/sqlite-vfs/blob/main/src/lib.rs
-
+///! A lot of the work here is being cribbed from https://github.com/rkusa/sqlite-vfs/blob/main/src/lib.rs
 use libsqlite3_sys as ffi;
 use std::{
     borrow::Cow,
@@ -450,7 +449,7 @@ fn null_ptr_error() -> std::io::Error {
 }
 
 mod node {
-    use std::{borrow::Borrow, ffi::CStr, io::ErrorKind, mem::ManuallyDrop};
+    use std::{ffi::CStr, io::ErrorKind, mem::ManuallyDrop};
 
     use super::*;
 
@@ -933,10 +932,15 @@ mod node {
             }
 
             // Sent to the VFS after a transaction has been committed immediately but before the
-            // database is unlocked. Silently ignored.
+            // database is unlocked.
             ffi::SQLITE_FCNTL_COMMIT_PHASETWO => {
-                println!("[vfs::fcntrl] Transaction committed; prepping to unlock database.",);
-                ffi::SQLITE_OK
+                // let r = get_resource_from_state!(state, ffi::SQLITE_ERROR, &state.database_name);
+                println!(
+                    "[vfs::fcntrl] Transaction committed; prepping to unlock database {:#?}.",
+                    p_arg
+                );
+                // r.begin_precommit();
+                ffi::SQLITE_NOTFOUND
             }
 
             // Used for debugging. Swap the file handle with the one pointed to by the pArg
@@ -1326,8 +1330,8 @@ mod fs {
         ffi::SQLITE_OK
     }
     pub unsafe extern "C" fn dl_open<V>(
-        p_vfs: *mut ffi::sqlite3_vfs,
-        z_path: *const raw::c_char,
+        _p_vfs: *mut ffi::sqlite3_vfs,
+        _z_path: *const raw::c_char,
     ) -> *mut raw::c_void {
         ptr::null_mut() as *mut raw::c_void
     }
