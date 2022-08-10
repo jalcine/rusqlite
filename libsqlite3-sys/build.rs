@@ -477,6 +477,10 @@ mod bindings {
         "bindgen-bindings/bindgen_3.6.8.rs",
         #[cfg(feature = "min_sqlite_version_3_6_23")]
         "bindgen-bindings/bindgen_3.6.23.rs",
+        #[cfg(feature = "min_sqlite_version_3_7_0")]
+        "bindgen-bindings/bindgen_3.7.0.rs",
+        #[cfg(feature = "min_sqlite_version_3_7_6")]
+        "bindgen-bindings/bindgen_3.7.6.rs",
         #[cfg(feature = "min_sqlite_version_3_7_7")]
         "bindgen-bindings/bindgen_3.7.7.rs",
         #[cfg(feature = "min_sqlite_version_3_7_16")]
