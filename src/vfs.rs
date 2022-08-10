@@ -39,6 +39,13 @@ macro_rules! from_cstr {
     };
 }
 
+macro_rules! log {
+    ($str: expr) => {
+        #[cfg(feature = "trace")]
+        crate::trace::log(0, $str);
+    };
+}
+
 /// Options for opening a file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenOptions {
@@ -213,9 +220,9 @@ fn no_file_err(path: &str) -> std::io::Error {
 
 impl<F: Filesystem> File<F> {
     /// Reads some bytes into a buffer.
-    pub fn read_bytes(&mut self, mut buffer: &mut [u8], offset: usize) -> std::io::Result<()> {
+    pub fn read_bytes(&mut self, buffer: &mut [u8], offset: usize) -> std::io::Result<()> {
         if let Some(r) = self.resource.as_mut() {
-            r.read_bytes(&mut buffer, offset)
+            r.read_bytes(buffer, offset)
         } else {
             Err(no_file_err(&self.database_name))
         }
@@ -474,7 +481,8 @@ mod node {
     pub unsafe extern "C" fn close<F: Filesystem>(p_file: *mut ffi::sqlite3_file) -> raw::c_int {
         let state = get_state!(p_file);
 
-        println!("[vfs::close] Closing {:?}", state.database_name);
+        log!(&format!("[vfs::close] Closing {:?}", state.database_name));
+
         let r = get_resource_from_state!(state, ffi::SQLITE_IOERR_CLOSE, &state.database_name);
 
         if let Err(e) = r.close() {
@@ -510,7 +518,7 @@ mod node {
                 ffi::SQLITE_IOERR_SHORT_READ
             } else {
                 println!("[vfs::read] failed {:#?}", err);
-                return state.state.set_last_error(ffi::SQLITE_IOERR_READ, err);
+                state.state.set_last_error(ffi::SQLITE_IOERR_READ, err)
             }
         } else {
             println!("[vfs::read] Reporting back {} bytes", out.len());
@@ -711,7 +719,7 @@ mod node {
                         .state
                         .error
                         .lock()
-                        .map(|g| g.as_ref().map(|(code, _)| code.clone()).unwrap_or_default())
+                        .map(|g| g.as_ref().map(|(code, _)| *code).unwrap_or_default())
                     {
                         *p_arg = code;
                     }
@@ -870,10 +878,10 @@ mod node {
 
                     ffi::SQLITE_OK
                 } else {
-                    return state.state.set_last_error(
+                    state.state.set_last_error(
                         ffi::SQLITE_IOERR_READ,
                         std::io::Error::new(std::io::ErrorKind::Other, "Missing a valid path name"),
-                    );
+                    )
                 }
             }
 
@@ -1262,9 +1270,7 @@ mod fs {
             *p_res_out = ok as i32;
             println!(
                 "[vfs::access] The flag {:?} for {:?} exists? [{}]",
-                flags,
-                path,
-                ok.to_string()
+                flags, path, ok
             );
             Ok(())
         }) {
@@ -1350,7 +1356,7 @@ mod fs {
         };
 
         if let Some(dlerror) = state.parent.as_ref().and_then(|v| v.xDlError) {
-            return dlerror(state.parent, n_byte, z_err_msg);
+            dlerror(state.parent, n_byte, z_err_msg)
         }
     }
 
@@ -1386,7 +1392,7 @@ mod fs {
         };
 
         if let Some(dl_close) = state.parent.as_ref().and_then(|v| v.xDlClose) {
-            return dl_close(state.parent, p_handle);
+            dl_close(state.parent, p_handle)
         }
     }
 
@@ -1551,10 +1557,10 @@ pub fn register<F: Filesystem>(
 
     let vfs_register_result = unsafe { ffi::sqlite3_vfs_register(vfs, as_default as raw::c_int) };
     if vfs_register_result != ffi::SQLITE_OK {
-        return Err(Error::SqliteFailure(
+        Err(Error::SqliteFailure(
             ffi::Error::new(vfs_register_result),
             Some("Failed to register the VFS.".to_string()),
-        ));
+        ))
     } else {
         Ok(())
     }

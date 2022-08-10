@@ -69,7 +69,7 @@ mod vfs_test {
                 reader.stream_position()
             );
 
-            reader.read_exact(&mut buffer)?;
+            reader.read_exact(buffer)?;
 
             println!(
                 "[[test]] at position after 'read': {:?}",
@@ -83,7 +83,7 @@ mod vfs_test {
         fn write_bytes(&mut self, buffer: &[u8], offset: usize) -> std::io::Result<()> {
             println!("[[test]] writing bytes.");
             let mut file = self.file()?;
-            let new_pos = file.seek(std::io::SeekFrom::Start(offset as u64))?;
+            let _new_pos = file.seek(std::io::SeekFrom::Start(offset as u64))?;
             file.write_all(buffer)
         }
 
