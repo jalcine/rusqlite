@@ -13,12 +13,12 @@ license = "MIT"
 categories = ["database"]
 
 exclude = [
-    "/.github/*",
-    "/.gitattributes",
-    "/appveyor.yml",
-    "/Changelog.md",
-    "/clippy.toml",
-    "/codecov.yml",
+	"/.github/*",
+	"/.gitattributes",
+	"/appveyor.yml",
+	"/Changelog.md",
+	"/clippy.toml",
+	"/codecov.yml",
 ]
 
 [badges]
@@ -46,8 +46,8 @@ trace = []
 bundled = ["libsqlite3-sys/bundled", "modern_sqlite"]
 bundled-sqlcipher = ["libsqlite3-sys/bundled-sqlcipher", "bundled"]
 bundled-sqlcipher-vendored-openssl = [
-    "libsqlite3-sys/bundled-sqlcipher-vendored-openssl",
-    "bundled-sqlcipher",
+	"libsqlite3-sys/bundled-sqlcipher-vendored-openssl",
+	"bundled-sqlcipher",
 ]
 buildtime_bindgen = ["libsqlite3-sys/buildtime_bindgen"]
 limits = []
@@ -86,52 +86,54 @@ serialize = ["modern_sqlite"]
 # / etc. New features and optional dependencies that don't conflict with anything
 # else should be added here.
 modern-full = [
-    "array",
-    "backup",
-    "blob",
-    "modern_sqlite",
-    "chrono",
-    "collation",
-    "column_decltype",
-    "csvtab",
-    "extra_check",
-    "functions",
-    "hooks",
-    "i128_blob",
-    "jiff",
-    "limits",
-    "load_extension",
-    "serde_json",
-    "serialize",
-    "series",
-    "time",
-    "trace",
-    "unlock_notify",
-    "url",
-    "uuid",
-    "vtab",
-    "window",
+	"array",
+	"backup",
+	"blob",
+	"modern_sqlite",
+	"chrono",
+	"collation",
+	"column_decltype",
+	"csvtab",
+	"extra_check",
+	"functions",
+	"hooks",
+	"i128_blob",
+	"jiff",
+	"limits",
+	"load_extension",
+	"serde_json",
+	"serialize",
+	"series",
+	"time",
+	"trace",
+	"unlock_notify",
+	"ulid",
+	"url",
+	"uuid",
+	"vtab",
+	"window",
 ]
 
 bundled-full = ["modern-full", "bundled"]
 
 [dependencies]
 jiff = { version = "0.1", optional = true, default-features = false, features = [
-    "std",
+	"std",
 ] }
 time = { version = "0.3.36", features = [
-    "formatting",
-    "macros",
-    "parsing",
+	"formatting",
+	"macros",
+	"parsing",
 ], optional = true }
 bitflags = "2.6.0"
 hashlink = "0.10"
 chrono = { version = "0.4.38", optional = true, default-features = false, features = [
-    "clock",
+	"clock",
 ] }
 serde_json = { version = "1.0", optional = true }
 csv = { version = "1.1", optional = true }
 url = { version = "2.1", optional = true }
+ulid = { version = "1.1", optional = true }
 fallible-iterator = "0.3"
 fallible-streaming-iterator = "0.1"
 uuid = { version = "1.0", optional = true }

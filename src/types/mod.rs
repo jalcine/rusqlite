@@ -91,9 +91,13 @@ mod serde_json;
 #[cfg_attr(docsrs, doc(cfg(feature = "time")))]
 mod time;
 mod to_sql;
+#[cfg(feature = "ulid")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ulid")))]
+mod ulid;
 #[cfg(feature = "url")]
 #[cfg_attr(docsrs, doc(cfg(feature = "url")))]
 mod url;
+
 mod value;
 mod value_ref;
 
