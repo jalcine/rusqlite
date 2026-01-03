@@ -644,6 +644,37 @@ impl Connection {
         self.db.borrow_mut().last_insert_rowid()
     }
 
+    /// Set the rowid of the most recent successful INSERT.
+    ///
+    /// This allows explicitly setting the rowid, primarily for error detection
+    /// purposes (e.g., resetting to zero to verify inserts succeeded).
+    ///
+    /// Uses [sqlite3_set_last_insert_rowid](https://www.sqlite.org/c3ref/set_last_insert_rowid.html) under
+    /// the hood.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use rusqlite::{Connection, Result};
+    /// fn main() -> Result<()> {
+    ///     let conn = Connection::open_in_memory()?;
+    ///     conn.execute("CREATE TABLE foo(x INTEGER PRIMARY KEY)", [])?;
+    ///     conn.execute("INSERT INTO foo DEFAULT VALUES", [])?;
+    ///
+    ///     // Reset rowid for error detection
+    ///     conn.set_last_insert_rowid(0)?;
+    ///     assert_eq!(conn.last_insert_rowid(), 0);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[inline]
+    pub fn set_last_insert_rowid(&self, rowid: i64) -> Result<()> {
+        unsafe {
+            ffi::sqlite3_set_last_insert_rowid(self.db.borrow_mut().db(), rowid);
+            Ok(())
+        }
+    }
+
     /// Convenience method to execute a query that is expected to return a
     /// single row.
     ///
@@ -1778,6 +1809,38 @@ mod test {
             stmt.execute([])?;
         }
         assert_eq!(db.last_insert_rowid(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_last_insert_rowid() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(x INTEGER PRIMARY KEY)")?;
+        db.execute_batch("INSERT INTO foo DEFAULT VALUES")?;
+
+        assert_eq!(db.last_insert_rowid(), 1);
+
+        db.set_last_insert_rowid(0)?;
+        assert_eq!(db.last_insert_rowid(), 0);
+
+        db.set_last_insert_rowid(999)?;
+        assert_eq!(db.last_insert_rowid(), 999);
+
+        db.execute_batch("INSERT INTO foo DEFAULT VALUES")?;
+        assert_eq!(db.last_insert_rowid(), 2);
+
+        db.set_last_insert_rowid(0)?;
+        assert_eq!(db.last_insert_rowid(), 0);
+
+        db.set_last_insert_rowid(-1)?;
+        assert_eq!(db.last_insert_rowid(), -1);
+
+        db.set_last_insert_rowid(-999)?;
+        assert_eq!(db.last_insert_rowid(), -999);
+
+        db.set_last_insert_rowid(100)?;
+        assert_eq!(db.last_insert_rowid(), 100);
+
         Ok(())
     }
 
